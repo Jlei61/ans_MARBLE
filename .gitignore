@@ -1,0 +1,9 @@
+examples/
+preprocessed/
+outputs/
+
+*.pt
+*.png
+*.svg
+*.pdf
+*.html
