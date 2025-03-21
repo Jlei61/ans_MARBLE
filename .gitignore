@@ -1,7 +1,7 @@
 examples/
 preprocessed/
 outputs/
-MARBLE/
+
 
 *.pt
 *.png
