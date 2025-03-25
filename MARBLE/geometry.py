@@ -23,102 +23,71 @@ from ptu_dijkstra import connections, tangent_frames  # isort:skip
 from MARBLE.lib.cknn import cknneighbors_graph  # isort:skip
 from MARBLE import utils  # isort:skip
 
-def memory_efficient_fps(x, N=None, spacing=0.1, start_idx=0):
-    """Memory-efficient furthest point sampling
+def furthest_point_sampling_memory_efficient(x, N=None, spacing=0.0, start_idx=0):
+    """A memory-efficient greedy algorithm to do furthest points sampling
     
-    This implementation avoids computing the full O(N²) pairwise distance matrix,
-    instead computing distances in batches and only storing O(N) memory.
-    The algorithm produces results that are numerically equivalent to the original
-    furthest_point_sampling function, but with significantly reduced memory usage.
+    This implementation avoids storing the full pairwise distance matrix,
+    reducing the space complexity from O(N²) to O(N).
     
     Args:
         x (nxdim matrix): input data
-        N (int): number of sampled points, if None will sample until spacing criterion is met
-        spacing (float): minimum distance between points (used as stopping criterion)
+        N (int): number of sampled points
+        spacing: when reaching this fraction of the total manifold diameter, we stop sampling
         start_idx: index of starting node
-        
+
     Returns:
-        perm: node indices of the sampled points
+        perm: node indices of the N sampled points
         lambdas: list of distances of furthest points
     """
     if spacing == 0.0:
         return torch.arange(len(x)), None
+    
+    n_total = len(x)
+    n = n_total if N is None else N
+    
+    # Calculate diameter without storing full distance matrix
+    if spacing > 0:
+        max_dist = 0
+        for i in range(100):  # Sample a subset to estimate diameter
+            idx1 = torch.randint(0, n_total, (1,)).item()
+            idx2 = torch.randint(0, n_total, (1,)).item()
+            dist = torch.norm(x[idx1] - x[idx2])
+            max_dist = max(max_dist, dist.item())
+        diam = max_dist
+    
+    # Initialize selected points and distances
+    perm = torch.zeros(n, dtype=torch.int64)
+    perm[0] = start_idx
+    lambdas = torch.zeros(n)
+    
+    # Track minimum distance from each point to any selected point
+    min_dists = torch.full((n_total,), float('inf'))
+    
+    # Update distances for the first point
+    for i in range(n_total):
+        min_dists[i] = torch.norm(x[i] - x[start_idx])
+    
+    # Iteratively select the furthest point
+    for i in range(1, n):
+        idx = torch.argmax(min_dists)
+        perm[i] = idx
+        lambdas[i] = min_dists[idx]
         
-    # Convert to numpy if tensor
-    is_torch = isinstance(x, torch.Tensor)
-    if is_torch:
-        x_np = x.detach().cpu().numpy()
-    else:
-        x_np = x
-    
-    n = len(x_np)
-    batch_size = min(1000, n)  # Adjust batch size for smaller datasets
-    
-    # Start with the specified point
-    if isinstance(start_idx, torch.Tensor) and start_idx.numel() == 1:
-        start_idx = start_idx.item()
-    
-    selected_indices = [start_idx]
-    selected_points = [x_np[start_idx]]
-    
-    # Keep distances to closest selected point
-    min_distances = np.full(n, np.inf)
-    lambdas_list = [0.0]  # First point has zero distance
-    
-    # Calculate manifold diameter (approximate)
-    diam = None
-    if N is None and spacing > 0:
-        # Estimate diameter using a sample of points
-        sample_size = min(500, n)
-        indices = np.random.choice(n, sample_size, replace=False)
-        sample_points = x_np[indices]
-        # Get max distance within sample as diameter estimate
-        if sample_size > 1:
-            diam_estimate = 0
-            for i in range(sample_size):
-                dists = np.sum((sample_points - sample_points[i])**2, axis=1)**0.5
-                max_dist = np.max(dists)
-                diam_estimate = max(diam_estimate, max_dist)
-            diam = diam_estimate
-    
-    while True:
-        # Process in batches to update distances
-        for batch_start in range(0, n, batch_size):
-            batch_end = min(batch_start + batch_size, n)
-            batch_indices = list(range(batch_start, batch_end))
-            
-            # Calculate distances between current batch and all selected points
-            for selected_point in selected_points:
-                batch_data = x_np[batch_indices]
-                dists = np.sum((batch_data - selected_point)**2, axis=1)**0.5
-                min_distances[batch_indices] = np.minimum(min_distances[batch_indices], dists)
+        # Update minimum distances
+        for j in range(n_total):
+            dist = torch.norm(x[j] - x[idx])
+            min_dists[j] = min(min_dists[j], dist)
         
-        # Find furthest point
-        furthest_idx = np.argmax(min_distances)
-        furthest_dist = min_distances[furthest_idx]
-        
-        # Stop conditions
-        if N is not None and len(selected_indices) >= N:
-            break
-            
-        if N is None and diam is not None and furthest_dist / diam < spacing:
-            break
-            
-        # Add the furthest point
-        selected_indices.append(furthest_idx)
-        selected_points.append(x_np[furthest_idx])
-        lambdas_list.append(furthest_dist)
-        
-        # Mark this point as visited by setting its distance to 0
-        min_distances[furthest_idx] = 0
+        if N is None and spacing > 0:
+            if lambdas[i] / diam < spacing:
+                perm = perm[:i]
+                lambdas = lambdas[:i]
+                break
     
-    # Convert to torch tensors to match furthest_point_sampling output
-    perm = torch.tensor(selected_indices, dtype=torch.int64)
-    lambdas = torch.tensor(lambdas_list)
-    
-    assert len(perm) == len(np.unique(selected_indices)), "Returned duplicated points"
+    assert len(perm) == len(torch.unique(perm)), "Returned duplicated points"
     
     return perm, lambdas
+
 
 def furthest_point_sampling(x, N=None, spacing=0.0, start_idx=0):
     """A greedy O(N^2) algorithm to do furthest points sampling
@@ -453,40 +422,18 @@ def manifold_dimension(Sigma, frac_explained=0.9):
 
 
 def fit_graph(x, graph_type="cknn", par=1, delta=1.0, metric="euclidean"):
-    """Fit graph to node positions, leveraging CUDA if the input tensor is on GPU.
-
-    Args:
-        x: Matrix with position of points, can be on CPU or GPU
-        graph_type: Type of nearest-neighbours graph: cknn (default), knn or radius
-        par: Number of nearest-neighbours to construct the graph or radius
-        delta: Argument for cknn graph construction to decide the radius for each points
-        metric: Metric used to fit proximity graph
-
-    Returns:
-        edge_index: Edge index tensor
-        edge_weight: Edge weight tensor
-    """
-    device = x.device
-    using_cuda = device.type == 'cuda'
+    """Fit graph to node positions"""
 
     if graph_type == "cknn":
-        # cknn implementation still requires CPU
-        if using_cuda:
-            x_cpu = x.cpu()
-            edge_index = cknneighbors_graph(x_cpu, n_neighbors=par, delta=delta, metric=metric).tocoo()
-        else:
-            edge_index = cknneighbors_graph(x, n_neighbors=par, delta=delta, metric=metric).tocoo()
-            
+        edge_index = cknneighbors_graph(x, n_neighbors=par, delta=delta, metric=metric).tocoo()
         edge_index = np.vstack([edge_index.row, edge_index.col])
-        edge_index = utils.np2torch(edge_index, dtype="long").to(device)
+        edge_index = utils.np2torch(edge_index, dtype="double")
 
     elif graph_type == "knn":
-        # knn_graph from PyG supports CUDA tensors directly
         edge_index = knn_graph(x, k=par)
         edge_index = PyGu.add_self_loops(edge_index)[0]
 
     elif graph_type == "radius":
-        # radius_graph from PyG supports CUDA tensors directly
         edge_index = radius_graph(x, r=par)
         edge_index = PyGu.add_self_loops(edge_index)[0]
 
@@ -496,8 +443,6 @@ def fit_graph(x, graph_type="cknn", par=1, delta=1.0, metric="euclidean"):
     assert is_connected(edge_index), "Graph is not connected! Try increasing k."
 
     edge_index = PyGu.to_undirected(edge_index)
-    
-    # Compute pairwise distances efficiently (respecting device)
     pdist = torch.nn.PairwiseDistance(p=2)
     edge_weight = pdist(x[edge_index[0]], x[edge_index[1]])
     edge_weight = 1 / edge_weight
@@ -574,29 +519,19 @@ def compute_connection_laplacian(data, R, normalization="rw"):
     return Lc.coalesce()
 
 
-def compute_gauges(data, dim_man=None, n_geodesic_nb=10, processes=1, use_cuda=False):
+def compute_gauges(data, dim_man=None, n_geodesic_nb=10, processes=1):
     """Orthonormal gauges for the tangent space at each node.
 
     Args:
         data: Pytorch geometric data object.
         n_geodesic_nb: number of geodesic neighbours. The default is 10.
         processes: number of CPUs to use
-        use_cuda: Whether to use CUDA acceleration if available
 
     Returns:
         gauges (nxdimxdim matrix): Matrix containing dim unit vectors for each node.
         Sigma: Singular valued
     """
-    cuda_available = torch.cuda.is_available() and use_cuda
-    
-    # Get data CPU numpy representation for tangent_frames function
-    if cuda_available:
-        print("\n---- Using GPU-accelerated tensor operations for gauge computation")
-        # Extract data from GPU if needed
-        X = data.pos.cpu().numpy().astype(np.float64)
-    else:
-        X = data.pos.numpy().astype(np.float64)
-        
+    X = data.pos.numpy().astype(np.float64)
     A = PyGu.to_scipy_sparse_matrix(data.edge_index).tocsr()
 
     # make chunks for data processing
@@ -619,17 +554,8 @@ def compute_gauges(data, dim_man=None, n_geodesic_nb=10, processes=1, use_cuda=F
 
     gauges, Sigma = zip(*out)
     gauges, Sigma = np.vstack(gauges), np.vstack(Sigma)
-    
-    # Convert results back to torch tensors, possibly on GPU
-    gauges_tensor = utils.np2torch(gauges)
-    Sigma_tensor = utils.np2torch(Sigma)
-    
-    if cuda_available:
-        device = data.x.device
-        gauges_tensor = gauges_tensor.to(device)
-        Sigma_tensor = Sigma_tensor.to(device)
 
-    return gauges_tensor, Sigma_tensor
+    return utils.np2torch(gauges), utils.np2torch(Sigma)
 
 
 def _compute_gauges(inputs, i):
@@ -640,7 +566,7 @@ def _compute_gauges(inputs, i):
     return gauges, Sigma
 
 
-def compute_connections(data, gauges, processes=1, use_cuda=False):
+def compute_connections(data, gauges, processes=1):
     """Find smallest rotations R between gauges pairs. It is assumed that the first
     row of edge_index is what we want to align to, i.e.,
     gauges(i) = gauges(j)@R[i,j].T
@@ -654,20 +580,11 @@ def compute_connections(data, gauges, processes=1, use_cuda=False):
         data: Pytorch geometric data object
         gauges (nxdxd matrix): Orthogonal unit vectors for each node
         processes: number of CPUs to use
-        use_cuda: Whether to use CUDA acceleration if available
 
     Returns:
         (n*dim,n*dim) matrix of rotation matrices
     """
-    cuda_available = torch.cuda.is_available() and use_cuda
-    
-    # Move to CPU for computation with the connections function
-    if cuda_available:
-        print("\n---- Using GPU-accelerated tensor operations for connections")
-        gauges_cpu = gauges.cpu().numpy().astype(np.float64)
-    else:
-        gauges_cpu = np.array(gauges, dtype=np.float64)
-        
+    gauges = np.array(gauges, dtype=np.float64)
     A = PyGu.to_scipy_sparse_matrix(data.edge_index).tocsr()
 
     # make chunks for data processing
@@ -675,10 +592,10 @@ def compute_connections(data, gauges, processes=1, use_cuda=False):
     dim_man = gauges.shape[-1]
 
     n = len(sl) - 1
-    gauges_chunks = [gauges_cpu[sl[i] : sl[i + 1]] for i in range(n)]
-    A_chunks = [A[sl[i] : sl[i + 1], :][:, sl[i] : sl[i + 1]] for i in range(n)]
+    gauges = [gauges[sl[i] : sl[i + 1]] for i in range(n)]
+    A = [A[sl[i] : sl[i + 1], :][:, sl[i] : sl[i + 1]] for i in range(n)]
 
-    inputs = [gauges_chunks, A_chunks, dim_man]
+    inputs = [gauges, A, dim_man]
     out = utils.parallel_proc(
         _compute_connections,
         range(n),
@@ -686,15 +603,8 @@ def compute_connections(data, gauges, processes=1, use_cuda=False):
         processes=processes,
         desc="\n---- Computing connections...",
     )
-    
-    # Combine results and move to appropriate device
-    result = utils.to_block_diag(out)
-    
-    if cuda_available:
-        device = data.x.device
-        result = result.to(device)
-        
-    return result
+
+    return utils.to_block_diag(out)
 
 
 def _compute_connections(inputs, i):
@@ -709,14 +619,13 @@ def _compute_connections(inputs, i):
     return torch.sparse_coo_tensor(edge_index, R.flatten(), dtype=torch.float32).coalesce()
 
 
-def compute_eigendecomposition(A, k=None, eps=1e-8, use_cuda=False):
+def compute_eigendecomposition(A, k=None, eps=1e-8):
     """Eigendecomposition of a square matrix A.
 
     Args:
         A: square matrix A
         k: number of eigenvectors
         eps: small error term
-        use_cuda: Whether to use CUDA acceleration if available
 
     Returns:
         evals (k): eigenvalues of the Laplacian
@@ -724,55 +633,21 @@ def compute_eigendecomposition(A, k=None, eps=1e-8, use_cuda=False):
     """
     if A is None:
         return None
-        
-    cuda_available = torch.cuda.is_available() and use_cuda
-    
-    # Determine current device and target device
-    if isinstance(A, torch.Tensor):
-        current_device = A.device
-    else:
-        current_device = torch.device('cpu')
-        
-    target_device = torch.device('cuda') if cuda_available else current_device
 
     if k is None:
-        # For full eigendecomposition, we prefer to use PyTorch's GPU implementation when available
-        if isinstance(A, torch.Tensor):
-            # Convert to dense if it's a sparse tensor
-            if A.is_sparse:
-                A = A.to_dense()
-            
-            # Move to appropriate device
-            A = A.to(target_device).double()
-        else:
-            # Convert sparse matrix to tensor
-            indices, values, size = A.indices(), A.values(), A.size()
-            A = torch.sparse_coo_tensor(indices, values, size).to_dense().to(target_device).double()
+        A = A.to_dense().double()
     else:
-        # For partial eigendecomposition, we use scipy.sparse.linalg.eigsh
-        # which requires CPU, so we'll convert back to numpy
-        if isinstance(A, torch.Tensor):
-            indices, values, size = A.indices(), A.values(), A.size()
-            A = sp.coo_array((values.cpu().numpy(), (indices[0].cpu().numpy(), indices[1].cpu().numpy())), shape=size)
-        else:
-            indices, values, size = A.indices(), A.values(), A.size()
-            A = sp.coo_array((values, (indices[0], indices[1])), shape=size)
+        indices, values, size = A.indices(), A.values(), A.size()
+        A = sp.coo_array((values, (indices[0], indices[1])), shape=size)
 
     failcount = 0
     while True:
         try:
             if k is None:
-                # Use torch.linalg.eigh for full eigendecomposition on GPU if available
                 evals, evecs = torch.linalg.eigh(A)  # pylint: disable=not-callable
             else:
-                # For partial, use scipy on CPU
                 evals, evecs = sp.linalg.eigsh(A, k=k, which="SM")
-                evals, evecs = torch.tensor(evals, device=current_device), torch.tensor(evecs, device=current_device)
-                
-                # Optionally move back to GPU for subsequent operations
-                if cuda_available:
-                    evals = evals.to(target_device)
-                    evecs = evecs.to(target_device)
+                evals, evecs = torch.tensor(evals), torch.tensor(evecs)
 
             evals = torch.clamp(evals, min=0.0)
             evecs *= np.sqrt(len(evecs))
@@ -785,129 +660,8 @@ def compute_eigendecomposition(A, k=None, eps=1e-8, use_cuda=False):
             failcount += 1
             print("--- decomp failed; adding eps ===> count: " + str(failcount))
             if k is None:
-                A += torch.eye(A.shape[0], device=A.device) * (eps * 10 ** (failcount - 1))
+                A += torch.eye(A.shape[0]) * (eps * 10 ** (failcount - 1))
             else:
                 A += sp.eye(A.shape[0]) * (eps * 10 ** (failcount - 1))
 
     return evals.float(), evecs.float()
-
-
-def cuda_memory_efficient_fps(x, N=None, spacing=0.1, start_idx=0):
-    """CUDA-accelerated memory-efficient furthest point sampling
-    
-    This implementation leverages GPU acceleration when available, while
-    still maintaining a memory-efficient approach that avoids O(N²) memory usage.
-    For large datasets, this can be significantly faster than CPU implementations.
-    
-    Args:
-        x (nxdim matrix): input data
-        N (int): number of sampled points, if None will sample until spacing criterion is met
-        spacing (float): minimum distance between points (used as stopping criterion)
-        start_idx: index of starting node
-        
-    Returns:
-        perm: node indices of the sampled points
-        lambdas: list of distances of furthest points
-    """
-    if spacing == 0.0:
-        return torch.arange(len(x), device=x.device), None
-    
-    # Ensure input is a torch tensor on the appropriate device
-    is_torch = isinstance(x, torch.Tensor)
-    if not is_torch:
-        x = torch.tensor(x, dtype=torch.float32)
-    
-    # Check if CUDA is available and the tensor is not already on CUDA
-    device = x.device
-    using_cuda = device.type == 'cuda'
-    if not using_cuda and torch.cuda.is_available():
-        device = torch.device('cuda')
-        x = x.to(device)
-        using_cuda = True
-    
-    n = len(x)
-    dim = x.shape[1]
-    
-    # Initialize start_idx
-    if isinstance(start_idx, torch.Tensor):
-        if start_idx.numel() == 1:
-            start_idx = start_idx.item()
-    
-    # Handle batching more efficiently on GPU
-    batch_size = 10000 if using_cuda else min(1000, n)
-    
-    # Initialize data structures on the device
-    selected_indices = [start_idx]
-    min_distances = torch.full((n,), float('inf'), device=device)
-    lambdas_list = [0.0]
-    
-    # Calculate approximate diameter for spacing criterion
-    diam = None
-    if N is None and spacing > 0:
-        sample_size = min(1000, n) if using_cuda else min(500, n)
-        sample_indices = torch.randperm(n, device=device)[:sample_size]
-        sample_points = x[sample_indices]
-        
-        if sample_size > 1:
-            if using_cuda and sample_size <= 5000:  # Full pairwise for smaller samples on GPU
-                sample_dists = torch.cdist(sample_points, sample_points)
-                diam = sample_dists.max().item()
-            else:  # Batch approach for larger samples
-                diam_estimate = 0
-                for i in range(0, sample_size, batch_size):
-                    end_idx = min(i + batch_size, sample_size)
-                    batch_points = sample_points[i:end_idx]
-                    batch_dists = torch.cdist(batch_points, sample_points)
-                    batch_max = batch_dists.max().item()
-                    diam_estimate = max(diam_estimate, batch_max)
-                diam = diam_estimate
-    
-    # Store the first selected point
-    selected_tensor = x[start_idx].unsqueeze(0)
-    
-    # Main FPS loop
-    while True:
-        # Process in batches
-        for batch_start in range(0, n, batch_size):
-            batch_end = min(batch_start + batch_size, n)
-            batch_indices = torch.arange(batch_start, batch_end, device=device)
-            
-            # Calculate distances efficiently using cdist
-            batch_data = x[batch_indices]
-            dists = torch.cdist(batch_data, selected_tensor).min(dim=1).values
-            
-            # Update minimum distances
-            current_min = min_distances[batch_indices]
-            min_distances[batch_indices] = torch.minimum(current_min, dists)
-        
-        # Find furthest point
-        furthest_idx = torch.argmax(min_distances).item()
-        furthest_dist = min_distances[furthest_idx].item()
-        
-        # Stop conditions
-        if N is not None and len(selected_indices) >= N:
-            break
-            
-        if N is None and diam is not None and furthest_dist / diam < spacing:
-            break
-            
-        # Add the furthest point
-        selected_indices.append(furthest_idx)
-        lambdas_list.append(furthest_dist)
-        
-        # Update selected points tensor efficiently
-        selected_tensor = torch.cat([selected_tensor, x[furthest_idx].unsqueeze(0)], dim=0)
-        
-        # Mark this point as visited
-        min_distances[furthest_idx] = 0
-    
-    # Create output tensors
-    perm = torch.tensor(selected_indices, dtype=torch.int64, device=device)
-    lambdas = torch.tensor(lambdas_list, device=device)
-    
-    # Move back to original device if needed
-    if device != x.device and is_torch:
-        perm = perm.to(x.device)
-        lambdas = lambdas.to(x.device)
-    
-    return perm, lambdas

@@ -25,8 +25,6 @@ def construct_dataset(
     seed=None,
     metric="euclidean",
     number_of_eigenvectors=None,
-    memory_efficient=False,
-    use_cuda=False,
 ):
     """Construct PyG dataset from node positions and features.
 
@@ -49,46 +47,21 @@ def construct_dataset(
               The default is None, which means a random starting vertex.
         metric: metric used to fit proximity graph
         number_of_eigenvectors: int number of eigenvectors to use. Default: None, meaning use all.
-        memory_efficient: Whether to use memory-efficient furthest point sampling. Default: False.
-              If True, uses O(N) memory algorithm instead of O(N²) for large datasets.
-              The classic algorithm computes the full pairwise distance matrix while
-              the memory-efficient version processes distances in batches.
-              Both algorithms should yield equivalent results, but the memory-efficient
-              version is recommended for large datasets.
-        use_cuda: Whether to use CUDA GPU acceleration when available. Default: False.
-              This can significantly speed up computations for large datasets,
-              especially when combined with memory_efficient=True.
     """
-    # Check CUDA availability
-    cuda_available = torch.cuda.is_available() if use_cuda else False
-    device = torch.device("cuda" if cuda_available else "cpu")
-    
-    # Function to move tensors to the appropriate device
-    def to_device(tensor_list):
-        return [t.to(device) for t in tensor_list]
 
-    anchor = [torch.tensor(a, dtype=torch.float32) for a in utils.to_list(anchor)]
-    vector = [torch.tensor(v, dtype=torch.float32) for v in utils.to_list(vector)]
-    
-    if cuda_available:
-        anchor = to_device(anchor)
-        vector = to_device(vector)
-    
+    anchor = [torch.tensor(a).float() for a in utils.to_list(anchor)]
+    vector = [torch.tensor(v).float() for v in utils.to_list(vector)]
     num_node_features = vector[0].shape[1]
 
     if label is None:
-        label = [torch.arange(len(a), device=a.device) for a in anchor]
+        label = [torch.arange(len(a)) for a in utils.to_list(anchor)]
     else:
-        label = [torch.tensor(lab, dtype=torch.float32) for lab in utils.to_list(label)]
-        if cuda_available:
-            label = to_device(label)
+        label = [torch.tensor(lab).float() for lab in utils.to_list(label)]
 
     if mask is None:
-        mask = [torch.zeros(len(a), dtype=torch.bool, device=a.device) for a in anchor]
+        mask = [torch.zeros(len(a), dtype=torch.bool) for a in utils.to_list(anchor)]
     else:
-        mask = [torch.tensor(m, dtype=torch.bool) for m in utils.to_list(mask)]
-        if cuda_available:
-            mask = to_device(mask)
+        mask = [torch.tensor(m) for m in utils.to_list(mask)]
 
     if spacing == 0.0:
         number_of_resamples = 1
@@ -99,19 +72,11 @@ def construct_dataset(
             if len(a) != 0:
                 # even sampling of points
                 if seed is None:
-                    start_idx = torch.randint(low=0, high=len(a), size=(1,), device=a.device)
+                    start_idx = torch.randint(low=0, high=len(a), size=(1,))
                 else:
                     start_idx = 0
 
-                # Choose appropriate sampling method based on parameters
-                if cuda_available and (memory_efficient or len(a) > 10000):
-                    # Use CUDA-accelerated version for large datasets
-                    sample_ind, _ = g.cuda_memory_efficient_fps(a, spacing=spacing, start_idx=start_idx)
-                elif memory_efficient:
-                    sample_ind, _ = g.memory_efficient_fps(a, spacing=spacing, start_idx=start_idx)
-                else:
-                    sample_ind, _ = g.furthest_point_sampling(a, spacing=spacing, start_idx=start_idx)
-                    
+                sample_ind, _ = g.furthest_point_sampling_memory_efficient(a, spacing=spacing, start_idx=start_idx)
                 sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
                 a_, v_, l_, m_ = (
                     a[sample_ind],
@@ -135,7 +100,7 @@ def construct_dataset(
                     edge_weight=edge_weight,
                     num_nodes=len(a_),
                     num_node_features=num_node_features,
-                    y=torch.ones(len(a_), dtype=int, device=a_.device) * i,
+                    y=torch.ones(len(a_), dtype=int) * i,
                     sample_ind=sample_ind,
                 )
 
@@ -156,7 +121,6 @@ def construct_dataset(
         n_geodesic_nb=k * frac_geodesic_nb,
         var_explained=var_explained,
         number_of_eigenvectors=number_of_eigenvectors,
-        use_cuda=cuda_available,
     )
 
 
@@ -166,7 +130,6 @@ def _compute_geometric_objects(
     var_explained=0.9,
     local_gauges=False,
     number_of_eigenvectors=None,
-    use_cuda=False,
 ):
     """
     Compute geometric objects used later: local gauges, Levi-Civita connections
@@ -178,7 +141,6 @@ def _compute_geometric_objects(
         var_explained: fraction of variance explained by the local gauges
         local_gauges: whether to use local or global gauges
         number_of_eigenvectors: int number of eigenvectors to use. Default: None, meaning use all.
-        use_cuda: Whether to use CUDA GPU acceleration when available. Default: False.
 
     Returns:
         data: pytorch geometric data object with the following new attributes
@@ -190,20 +152,10 @@ def _compute_geometric_objects(
         local_gauges: whether to use local gauges
 
     """
-    # Determine device based on use_cuda parameter and data location
-    cuda_available = torch.cuda.is_available() and use_cuda
-    device = data.x.device
-    
-    # If data is not on CUDA but CUDA is available and requested, move it
-    if cuda_available and device.type != 'cuda':
-        device = torch.device('cuda')
-        data = data.to(device)
-    
     n, dim_emb = data.pos.shape
     dim_signal = data.x.shape[1]
     print(f"\n---- Embedding dimension: {dim_emb}", end="")
     print(f"\n---- Signal dimension: {dim_signal}", end="")
-    print(f"\n---- Using device: {device}", end="")
 
     # disable vector computations if 1) signal is scalar or 2) embedding dimension
     # is <= 2. In case 2), either M=R^2 (manifold is whole space) or case 1).
@@ -218,23 +170,15 @@ def _compute_geometric_objects(
 
     if local_gauges:
         try:
-            # Use GPU for gauge computation if available
-            if cuda_available:
-                print("\n---- Computing tangent spaces with CUDA acceleration...", end="")
-                # Note: Some parts of gauge computation might still use CPU due to implementation specifics
-                gauges, Sigma = g.compute_gauges(data, n_geodesic_nb=n_geodesic_nb, use_cuda=cuda_available)
-            else:
-                gauges, Sigma = g.compute_gauges(data, n_geodesic_nb=n_geodesic_nb)
+            gauges, Sigma = g.compute_gauges(data, n_geodesic_nb=n_geodesic_nb)
         except Exception as exc:
             raise Exception(
                 "\nCould not compute gauges (possibly data is too sparse or the \
                   number of neighbours is too small)"
             ) from exc
     else:
-        gauges = torch.eye(dim_emb, device=device).repeat(n, 1, 1)
+        gauges = torch.eye(dim_emb).repeat(n, 1, 1)
 
-    # Compute Laplacian with GPU acceleration when available
-    print("\n---- Computing Laplacian operator...", end="")
     L = g.compute_laplacian(data)
 
     if local_gauges:
@@ -242,12 +186,9 @@ def _compute_geometric_objects(
         print(f"---- Manifold dimension: {data.dim_man}")
 
         gauges = gauges[:, :, : data.dim_man]
-        
-        print("\n---- Computing connections...", end="")
-        R = g.compute_connections(data, gauges, use_cuda=cuda_available)
+        R = g.compute_connections(data, gauges)
 
-        print("\n---- Computing kernels...", end="")
-        # Gradient operator computation can be accelerated on GPU
+        print("\n---- Computing kernels ... ", end="")
         kernels = g.gradient_op(data.pos, data.edge_index, gauges)
         kernels = [utils.tile_tensor(K, data.dim_man) for K in kernels]
         kernels = [K * R for K in kernels]
@@ -255,13 +196,13 @@ def _compute_geometric_objects(
         Lc = g.compute_connection_laplacian(data, R)
 
     else:
-        print("\n---- Computing kernels...", end="")
+        print("\n---- Computing kernels ... ", end="")
         kernels = g.gradient_op(data.pos, data.edge_index, gauges)
         Lc = None
 
     if number_of_eigenvectors is None:
         print(
-            """\n---- Computing full spectrum...
+            """\n---- Computing full spectrum ...
               (if this takes too long, then run construct_dataset()
               with number_of_eigenvectors specified) """,
             end="",
@@ -271,10 +212,8 @@ def _compute_geometric_objects(
             f"\n---- Computing spectrum with {number_of_eigenvectors} eigenvectors...",
             end="",
         )
-    
-    # Eigendecomposition can benefit greatly from CUDA acceleration
-    L = g.compute_eigendecomposition(L, k=number_of_eigenvectors, use_cuda=cuda_available)
-    Lc = g.compute_eigendecomposition(Lc, k=number_of_eigenvectors, use_cuda=cuda_available)
+    L = g.compute_eigendecomposition(L, k=number_of_eigenvectors)
+    Lc = g.compute_eigendecomposition(Lc, k=number_of_eigenvectors)
 
     data.kernels = [
         utils.to_SparseTensor(K.coalesce().indices(), value=K.coalesce().values()) for K in kernels
