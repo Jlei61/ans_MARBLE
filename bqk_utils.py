@@ -20,7 +20,22 @@ def notch_filt(data,fs,freqs):
 
 def band_filt(data,fs,freqband):
     nyq=fs/2
-    b,a=butter(3,[freqband[0]/nyq,freqband[1]/nyq],btype='bandpass')
+    # Ensure the upper frequency doesn't exceed Nyquist frequency
+    low_freq = min(freqband[0], nyq-1)
+    high_freq = min(freqband[1], nyq-1)
+    
+    # Ensure frequencies are valid
+    if low_freq <= 0:
+        low_freq = 0.1  # Set a small positive value if too low
+    if high_freq <= low_freq:
+        high_freq = low_freq + 1  # Ensure high_freq > low_freq
+        
+    # Normalize frequencies
+    low_norm = low_freq/nyq
+    high_norm = high_freq/nyq
+    
+    # Create bandpass filter
+    b,a=butter(3,[low_norm, high_norm],btype='bandpass')
     return filtfilt(b,a,data,axis=-1)
 
 def return_hil_enve(data,fs,freqband):
@@ -29,17 +44,46 @@ def return_hil_enve(data,fs,freqband):
     return np.abs(hilbert3(filt_data))
 
 def return_hil_enve_norm(data,fs,freqband):
+    # Ensure the freqband is valid (doesn't exceed Nyquist)
+    nyq = fs/2
+    freqband = [min(freqband[0], nyq-1), min(freqband[1], nyq-1)]
+    
+    # Ensure minimum frequency is positive
+    if freqband[0] <= 0:
+        freqband[0] = 0.1
+    
+    # Ensure valid frequency range
+    if freqband[1] <= freqband[0]:
+        freqband[1] = freqband[0] + 1
+    
+    # Process based on frequency band width
     if freqband[1]-freqband[0]<=20:
         return return_hil_enve(data,fs,freqband)
     else:
+        # Create frequency filter bank
         filter_bank=np.arange(freqband[0],freqband[1],20)
         filter_bank=np.append(filter_bank,freqband[1])
+        
+        # Create pairs of frequencies
         filter_bank=list(zip(filter_bank[:-1],filter_bank[1:]))
+        
+        # Process each frequency band
         multi_band_enve=[]
         for freq in filter_bank:
-            tmp_enve=return_hil_enve(data,fs,freq)
-            multi_band_enve.append(tmp_enve)
-        return np.sum(multi_band_enve,axis=0)
+            try:
+                tmp_enve=return_hil_enve(data,fs,freq)
+                multi_band_enve.append(tmp_enve)
+            except ValueError as e:
+                print(f"Warning: Skipping frequency band {freq} due to error: {e}")
+                continue
+        
+        # Return sum if we have any valid bands, otherwise use a smaller range
+        if multi_band_enve:
+            return np.sum(multi_band_enve,axis=0)
+        else:
+            safe_band = [min(freqband[0], nyq/4), min(freqband[1], nyq/2)]
+            print(f"Using safe frequency band {safe_band} instead of {freqband}")
+            return return_hil_enve(data,fs,safe_band)
 
 
 def return_timeRanges(onOff_array,fs,start_time=0):

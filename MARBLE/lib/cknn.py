@@ -15,8 +15,14 @@ def cknneighbors_graph(
     include_self=False,
     is_sparse=True,
     return_instance=False,
+    n_jobs=1,
 ):
-    """Main function to call, see CkNearestNeighbors for the doc."""
+    """Main function to call, see CkNearestNeighbors for the doc.
+    
+    Additional parameters:
+        n_jobs: int, optional, default=1
+            The number of parallel jobs to run. -1 means using all processors.
+    """
     cknn = CkNearestNeighbors(
         n_neighbors=n_neighbors,
         delta=delta,
@@ -24,6 +30,7 @@ def cknneighbors_graph(
         t=t,
         include_self=include_self,
         is_sparse=is_sparse,
+        n_jobs=n_jobs,
     )
     cknn.cknneighbors_graph(X)
 
@@ -63,6 +70,9 @@ class CkNearestNeighbors(object):
         is_sparse: bool, optional, default=True
             The method `cknneighbors_graph` returns csr_matrix object if this
             parameter is True else returns ndarray object.
+            
+        n_jobs: int, optional, default=1
+            The number of parallel jobs to run. -1 means using all processors.
     """
 
     def __init__(
@@ -73,6 +83,7 @@ class CkNearestNeighbors(object):
         t="inf",
         include_self=False,
         is_sparse=True,
+        n_jobs=1,
     ):
         self.n_neighbors = n_neighbors
         self.delta = delta
@@ -80,6 +91,7 @@ class CkNearestNeighbors(object):
         self.t = t
         self.include_self = include_self
         self.is_sparse = is_sparse
+        self.n_jobs = n_jobs
         self.ckng = None
 
     def cknneighbors_graph(self, X):
@@ -99,6 +111,7 @@ class CkNearestNeighbors(object):
         t = self.t
         include_self = self.include_self
         is_sparse = self.is_sparse
+        n_jobs = self.n_jobs
 
         n_samples = X.shape[0]
 
@@ -114,8 +127,18 @@ class CkNearestNeighbors(object):
                 raise ValueError("`X` must be square matrix")
             dmatrix = X
         else:
-            dmatrix = squareform(pdist(X, metric=metric))
+            # Use parallel computation for distance matrix when n_jobs != 1
+            if n_jobs != 1 and n_samples > 1000:
+                try:
+                    from sklearn.metrics import pairwise_distances
+                    dmatrix = pairwise_distances(X, metric=metric, n_jobs=n_jobs)
+                except ImportError:
+                    # Fall back to standard method if sklearn is not available
+                    dmatrix = squareform(pdist(X, metric=metric))
+            else:
+                dmatrix = squareform(pdist(X, metric=metric))
 
+        # Potentially compute partition in parallel for large matrices 
         darray_n_nbrs = np.partition(dmatrix, n_neighbors)[:, [n_neighbors]]
         ratio_matrix = dmatrix / np.sqrt(darray_n_nbrs.dot(darray_n_nbrs.T))
         diag_ptr = np.arange(n_samples)

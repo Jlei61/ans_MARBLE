@@ -25,6 +25,7 @@ def construct_dataset(
     seed=None,
     metric="euclidean",
     number_of_eigenvectors=None,
+    use_parallel=True,
 ):
     """Construct PyG dataset from node positions and features.
 
@@ -40,6 +41,7 @@ def construct_dataset(
         to map to tangent space k*frac_geodesic_nb
         stop_crit: stopping criterion for furthest point sampling
         number_of_resamples: number of furthest point sampling runs to prevent bias (experimental)
+                            if set to 0, no resampling will be performed
         var_explained: fraction of variance explained by the local gauges
         local_gauges: is True, it will try to compute local gauges if it can (signal dim is > 2,
             embedding dimension is > 2 or dim embedding is not dim of manifold)
@@ -66,28 +68,39 @@ def construct_dataset(
     if spacing == 0.0:
         number_of_resamples = 1
 
+    # If number_of_resamples is 0, set it to 1 but disable resampling
+    use_resampling = number_of_resamples > 0
+    if not use_resampling:
+        number_of_resamples = 1
+
     data_list = []
     for i, (a, v, l, m) in enumerate(zip(anchor, vector, label, mask)):
         for _ in range(number_of_resamples):
             if len(a) != 0:
-                # even sampling of points
-                if seed is None:
-                    start_idx = torch.randint(low=0, high=len(a), size=(1,))
-                else:
-                    start_idx = 0
+                # Apply resampling only if enabled
+                if use_resampling:
+                    # even sampling of points
+                    if seed is None:
+                        start_idx = torch.randint(low=0, high=len(a), size=(1,))
+                    else:
+                        start_idx = 0
 
-                sample_ind, _ = g.furthest_point_sampling_memory_efficient(a, spacing=spacing, start_idx=start_idx)
-                sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
-                a_, v_, l_, m_ = (
-                    a[sample_ind],
-                    v[sample_ind],
-                    l[sample_ind],
-                    m[sample_ind],
-                )
+                    sample_ind, _ = g.furthest_point_sampling_memory_efficient(a, spacing=spacing, start_idx=start_idx)
+                    sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
+                    a_, v_, l_, m_ = (
+                        a[sample_ind],
+                        v[sample_ind],
+                        l[sample_ind],
+                        m[sample_ind],
+                    )
+                else:
+                    # Use all points without resampling
+                    a_, v_, l_, m_ = a, v, l, m
+                    sample_ind = torch.arange(len(a))
 
                 # fit graph to point cloud
                 edge_index, edge_weight = g.fit_graph(
-                    a_, graph_type=graph_type, par=k, delta=delta, metric=metric
+                    a_, graph_type=graph_type, par=k, delta=delta, metric=metric, use_parallel=use_parallel
                 )
 
                 # define data object
@@ -109,7 +122,7 @@ def construct_dataset(
     # collate datasets
     batch = Batch.from_data_list(data_list)
     batch.degree = k
-    batch.number_of_resamples = number_of_resamples
+    batch.number_of_resamples = number_of_resamples if use_resampling else 0
 
     # split into training/validation/test datasets
     split = RandomNodeSplit(split="train_rest", num_val=0.1, num_test=0.1)

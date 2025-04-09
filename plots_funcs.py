@@ -2,7 +2,83 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+import mne
+from scipy import signal
+from scipy.signal import spectrogram
 
+
+def plot_seeg_channels(fif_file, duration=10, save_path=None):
+    """
+    Plot SEEG channels from a .fif file with vertical separation and custom styling.
+    
+    Parameters:
+    - fif_file: Path to the .fif file
+    - duration: Duration of data to plot (in seconds)
+    - save_path: Path to save the plot (optional, if None, displays plot)
+    """
+    # Load the .fif file
+    raw = mne.io.read_raw_fif(fif_file, preload=True)
+    
+    # Get sampling frequency and calculate number of samples
+    sfreq = raw.info['sfreq']
+    n_samples = int(duration * sfreq)
+    
+    # Extract data (limit to specified duration)
+    data, times = raw[:, :n_samples]
+    
+    # Standardize data to [-1, 1]
+    data_standardized = standardize_data(data)
+    
+    # Number of channels
+    n_channels = len(raw.ch_names)
+    
+    # Vertical offset for each channel
+    offset = 2.0
+    offsets = np.arange(0, n_channels * offset, offset)
+    
+    # Define colors: blue tones for electrode 1, red tones for electrode 2
+    # Assuming bipolar channels: 0-2 from electrode 1, 3-5 from electrode 2
+    colors = []
+    for i in range(n_channels):
+        if i < n_channels // 2:  # First half (electrode 1)
+            cmap = cm.Blues
+            shade = 0.4 + (i / (n_channels / 2)) * 0.5  # Range from 0.4 to 0.9
+        else:  # Second half (electrode 2)
+            cmap = cm.Reds
+            shade = 0.4 + ((i - n_channels / 2) / (n_channels / 2)) * 0.5
+        colors.append(cmap(shade))
+    
+    # Create figure
+    plt.figure(figsize=(24, n_channels * 1.2))
+    
+    # Plot each channel
+    for i in range(n_channels):
+        channel_data = data_standardized[i] + offsets[i]
+        plt.plot(times, channel_data, color=colors[i], linewidth=0.8, alpha=0.7)
+    
+    # Customize plot
+    plt.xlim(0, duration)  # Set x-axis from start to end
+    plt.xlabel('Time (s)')
+    plt.ylabel('Channel')
+    plt.title(f'SEEG Data: {fif_file} (First {duration} seconds)')
+    
+    # Set y-ticks to channel names at their offsets
+    plt.yticks(offsets, raw.ch_names)
+    
+    # Add a subtle grid
+    plt.grid(True, linestyle='--', alpha=0.3)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save or display
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to {save_path}")
+        plt.close()
+    else:
+        plt.show()
+        
 def plot_hfo_overlay(data, mask, fs, Chn_names, cmp, zoom_factor=1):
     """
     Plot SEEG data with HFO activity overlay.
@@ -96,168 +172,198 @@ def plot_hfo_event_with_signal(ax_signal, ax_spectrogram, Seeg_data, Sxx, t, f, 
     ax_spectrogram.set_ylim([0, 500])  # Limit to 500Hz for visualization of HFO
     ax_spectrogram.set_title(f'{Chn_names[channel]} Spectrogram [{start_time:.2f}-{end_time:.2f}s]')
 
-
-def create_violin_df(data, label, node_names,ez_idx):
-    df = pd.DataFrame({'Node': [node for node_name in node_names for node in [node_name] * len(data[node_names.index(node_name)])],
-                       'Value': [val for sublist in data for val in sublist],
-                       'Type': label})
-    df['is_ez'] = df['Node'].isin([node_names[i] for i in ez_idx])
-    return df
-
-def feature_violinplot(df1,df2,title1,title2,cmp):
-    plt.figure(figsize=(25, 12))
-    # Plot for rp_durations
-    plt.subplot(2,1,1)
-    sns.violinplot(x='Node', y='Value',hue='is_ez', data=df1,palette=[cmp[2], cmp[0]])
-    plt.title(title1)
-    plt.xlabel('Contacts')
-    plt.ylabel('Value')
-
-    plt.subplot(2,1,2)
-    sns.violinplot(x='Node', y='Value',hue='is_ez', data=df2,palette=[cmp[2], cmp[0]])
-    plt.title(title2)
-    plt.xlabel('Contacts')
-    plt.ylabel('Value')
-
-
-def feature_barplot(barplot_data,COI_bi_id,title,cmp):
-    # Convert to DataFrame
-    df_barplot = pd.DataFrame(barplot_data)
-
-    df_barplot['is_ez'] = df_barplot['contacts_id'].isin(COI_bi_id)
-
-    # Create the bar plot
-    plt.figure(figsize=(24, 6))
-    sns.barplot(x='contacts_name', y='events', hue='is_ez', data=df_barplot, palette=[cmp[2], cmp[0]])
-
-    plt.title(title)
-    plt.xlabel('Contact(#)')
-    plt.ylabel('Frequency')
-    plt.legend(title='EZ Index', labels=['Not in EZ', 'In EZ'])
-
-
-def SEM_violinplot(nn, eta_true, ez_idx, pz_idx, eta_posterior, eta_c, delta_eta ):
-    parts= plt.violinplot(eta_posterior, widths=0.7, showmeans=True, showextrema=True);
-    plt.plot(np.r_[0:nn]+1,eta_true ,'o', color='k', alpha=0.9, markersize=4)
-    plt.axhline(y=eta_c, linewidth=.8, color = 'r', linestyle='--')
-    plt.axhline(y=eta_c-delta_eta, linewidth=.8, color = 'y', linestyle='--')
-    plt.yticks(fontsize=14) 
-    plt.xticks(fontsize=14) 
-    #plt.xticks(np.r_[1:nn+1], np.r_[1:nn+1], rotation=90, fontsize=14)  
-    #plt.xticks(np.arange(1,nn+1, step=2),np.arange(1, nn+1, step=2), fontsize=12, rotation=0)
-    plt.ylabel(' Posterior ' +r'${(\eta_i)}$', fontsize=22);  
-    plt.xlabel('Brain nodes', fontsize=22); 
-
-    for pc in parts['bodies'][0:nn]:
-        pc.set_facecolor('g')
-        pc.set_edgecolor('g')
-        pc.set_alpha(0.5)
-    i = 0
-    while i < len(ez_idx):
-        for pc in parts['bodies'][ez_idx[i]:ez_idx[i]+1]:
-            pc.set_facecolor('r')
-            pc.set_edgecolor('r')
-            pc.set_alpha(0.8)
-        i += 1
-
-    j = 0
-    while j < len(pz_idx):
-        for pc in parts['bodies'][pz_idx[j]:pz_idx[j]+1]:
-            pc.set_facecolor('y')
-            pc.set_edgecolor('y')
-            pc.set_alpha(0.8)
-        j += 1
-    plt.tight_layout()
-    
-
-def plot_distribution_samples(distribution, n_samples=1000, tail_start=-8):
+def standardize_data(data):
     """
-    Plot samples from a custom distribution, with different colors for the normal and tail parts.
-
-    :param distribution: The custom distribution object.
-    :param n_samples: Number of samples to generate for plotting.
-    :param tail_start: The value where the tail starts.
+    Standardize data to the range [-1, 1].
     """
-    samples = distribution.sample((n_samples,))
+    data_min = np.min(data)
+    data_max = np.max(data)
+    if data_max == data_min:
+        return np.zeros_like(data)
+    standardized = 2 * (data - data_min) / (data_max - data_min) - 1
+    return standardized
 
-    # Split samples into normal and tail parts based on tail_start
-    normal_samples = samples[samples <= tail_start]
-    tail_samples = samples[samples > tail_start]
+def plot_ied_overlay(data, ied_events, fs, Chn_names, cmp=['b','r','g'], zoom_factor=1):
+    """
+    Plot SEEG data with IED events overlay.
 
-    # Plotting
-    plt.figure(figsize=(10, 6))
-    plt.hist(normal_samples, bins=50, color='blue', alpha=0.7, label='Normal Part')
-    plt.hist(tail_samples, bins=50, color='red', alpha=0.7, label='Long Tail Part')
-    plt.title('Visualization of Distribution Samples')
-    plt.xlabel('Sample Value')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.show()
+    Parameters:
+    - data: ndarray (channels x samples) - Raw SEEG data
+    - ied_events: List of lists where each inner list indicates start and end times of an IED event
+    - fs: Sampling frequency
+    - Chn_names: List of channel names
+    - cmp: List of colors [baseline_color, event_color, highlight_color]
+    - zoom_factor: Vertical zoom factor for visualization
+    """
+    n_channels, n_samples = data.shape
+    time = np.arange(n_samples) / fs
+    y_offsets = zoom_factor * np.arange(n_channels)
 
-def Res_violin(data, ROI_names, ez_bar, pz_bar, cmp, title):
-    # Set the figure size and title
-    plt.figure(figsize=(12, 24))
-    plt.title(title)
+    # Standardize data for better visualization
+    data_std = standardize_data(data)
 
-    # Determine the mean of each parameter across samples
-    means = np.mean(data, axis=0)
+    # Plot data with offsets
+    plt.figure(figsize=(25, 15))
+    for i in range(n_channels):
+        plt.plot(time, data_std[i, :] + y_offsets[i], color=cmp[0], lw=0.5)
 
-    # Create a DataFrame for easy plotting with Seaborn
-    df = pd.DataFrame(data, columns=ROI_names)
+    # Overlay IED activity with red color
+    for i, events in enumerate(ied_events):
+        for event in events:
+            start_time, end_time = event
+            start_idx = int(start_time * fs)
+            end_idx = int(end_time * fs)
+            
+            # Check if indices are within data length
+            start_idx = min(start_idx, n_samples - 1)
+            end_idx = min(end_idx, n_samples - 1)
+            
+            # Highlight the IED event area with a red background
+            plt.axvspan(time[start_idx], time[end_idx], color=cmp[1], alpha=0.3,
+                        ymin=(y_offsets[i] - 0.4) / (zoom_factor * n_channels),
+                        ymax=(y_offsets[i] + 0.4) / (zoom_factor * n_channels))
+            
+            # Plot the IED signal portion with a different color to make it stand out
+            plt.plot(time[start_idx:end_idx+1], 
+                     data_std[i, start_idx:end_idx+1] + y_offsets[i], 
+                     color=cmp[2], lw=1.0)
 
-    # Melt the DataFrame for horizontal violin plots
-    df_melted = df.melt(var_name='Parameter', value_name='Value')
-
-    # Default color for all violins
-    palette = [cmp[2]] * data.shape[1]
-
-    # Adjust colors based on the mean and thresholds
-    for i, mean in enumerate(means):
-        if ez_bar is not None and mean > ez_bar:
-            palette[i] = cmp[0]
-        elif pz_bar is not None and mean > pz_bar:
-            palette[i] = cmp[1]
-
-    # Create a horizontal violin plot
-    sns.violinplot(x='Value', y='Parameter', data=df_melted, palette=palette, inner=None)
-
-    # Adding vertical lines for ez_bar and pz_bar, if they are not None
-    if ez_bar is not None:
-        plt.axvline(x=ez_bar, color=cmp[0], linestyle='--', label='EZ Threshold')
-    if pz_bar is not None:
-        plt.axvline(x=pz_bar, color=cmp[1], linestyle='--', label='PZ Threshold')
-
-    # Show the legend if there are threshold lines
-    if ez_bar is not None or pz_bar is not None:
-        plt.legend()
-
-    # Display the plot
-    plt.tight_layout()
-    plt.show()
-
-def plot_sim_seeg(data,Chn_names,COI_id,cmp,Figure_folder,fs = 2000,T = 10):
-    plt.rcParams["axes.spines.right"] = False
-    plt.rcParams["axes.spines.top"] = False
-
-    nc = data.shape[0]
-    times = np.arange(0, T + 1/fs, 1/fs)
-
-    for i in range(0, nc):
-        if i in COI_id:
-            plt.plot(times,data[i,:]+1.5*i, cmp[0], lw=0.5)
-        else:
-            plt.plot(times,data[i,:]+1.5*i, cmp[2], lw=0.5)
     # Adjusting yticks
-    tick_positions = [1.5*i for i in range(nc)]
-    tick_labels = Chn_names
+    tick_positions = y_offsets
+    plt.yticks(tick_positions, Chn_names, fontsize=10)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Channels")
+    plt.xlim([time[0], time[-1]])
+    plt.ylim([-1, zoom_factor * n_channels])
+    plt.title("SEEG Data with IED Events Overlay")
+    plt.tight_layout()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.show()
 
-    plt.yticks(tick_positions, tick_labels, fontsize=10)
+def plot_hfo_event(data, fs, channel, start_time, end_time, Chn_names, baseline_duration=0.5, cmap='hot'):
+    """
+    Plots HFO event in both time and frequency domains, with pre-event baseline.
+    Uses external axes for more flexibility.
+    Uses wavelet transform for time-frequency analysis.
+    Subtracts the baseline to highlight event-specific changes.
+    Assumes data may already be filtered for HFO detection.
 
-    plt.xticks(np.arange(0,11,10),fontsize=16)
-    plt.title("Simulation SEEG",fontsize=18)
-    plt.xlabel('Time(s)',fontsize=25)
-    plt.ylabel('Electrodes(#)',fontsize=25)
-    plt.ylim([0-3, 1.5*nc+5])
-    plt.xlim([0, T])
-
-    plt.savefig(Figure_folder+'SEEG_SIM.png',dpi = 300)
+    Parameters:
+    - data: Raw signal data, shape (n_channels, n_samples)
+    - fs: Sampling frequency (in Hz)
+    - channel: Channel number to be plotted
+    - start_time: HFO event start time (in seconds)
+    - end_time: HFO event end time (in seconds)
+    - Chn_names: List of channel names
+    - baseline_duration: Duration of baseline to include before the event (in seconds)
+    - cmap: Color map for the wavelet scalogram
+    """
+    # Create figure and axes
+    fig, (ax_signal, ax_wavelet) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # Compute time for the raw data
+    n_channels, n_samples = data.shape
+    time_seeg = np.arange(n_samples) / fs
+    
+    # Calculate baseline start time
+    baseline_start = max(0, start_time - baseline_duration)
+    
+    # Convert time to indices for raw data
+    baseline_idx = max(0, int(baseline_start * fs))
+    start_idx = int(start_time * fs)
+    end_idx = min(n_samples, int(end_time * fs))
+    
+    # Extract baseline and event signals
+    baseline_signal = data[channel, baseline_idx:start_idx]
+    
+    # Define a window that includes baseline and event with some padding
+    display_start_idx = baseline_idx
+    display_end_idx = min(n_samples, end_idx + int(0.2 * fs))  # 0.2s after event
+    
+    # Extract the full segment for display
+    full_segment = data[channel, display_start_idx:display_end_idx]
+    full_time = time_seeg[display_start_idx:display_end_idx]
+    
+    # Calculate baseline mean
+    baseline_mean = np.mean(baseline_signal)
+    
+    # Subtract baseline mean from the full segment
+    baseline_corrected_signal = full_segment - baseline_mean
+    
+    # Plot baseline-corrected signal
+    ax_signal.plot(full_time, baseline_corrected_signal)
+    
+    # Highlight the baseline period
+    ax_signal.axvspan(baseline_start, start_time, color='lightblue', alpha=0.3, label='Baseline')
+    
+    # Highlight the HFO event
+    ax_signal.axvspan(start_time, end_time, color='red', alpha=0.3, label='HFO Event')
+    
+    # Add vertical lines at event boundaries
+    ax_signal.axvline(start_time, color='red', linestyle='--')
+    ax_signal.axvline(end_time, color='red', linestyle='--')
+    
+    ax_signal.set_title(f'{Chn_names[channel]} Signal [{start_time:.2f}-{end_time:.2f}s] (Baseline Corrected)')
+    ax_signal.set_xlabel('Time (s)')
+    ax_signal.set_ylabel('Amplitude (baseline corrected)')
+    ax_signal.legend()
+    ax_signal.grid(True, linestyle='--', alpha=0.3)
+    
+    # Compute wavelet transform directly on baseline-corrected signal
+    # Use scales optimized for higher frequencies
+    widths = np.arange(1, 101)  # Wider range of scales
+    cwtmatr = signal.cwt(baseline_corrected_signal, signal.morlet2, widths)
+    
+    # Convert scales to frequencies (approximate)
+    frequencies = fs / (2 * widths)
+    
+    # Extract baseline and event segments for normalization
+    baseline_wavelet_idx = np.where((full_time >= baseline_start) & (full_time < start_time))[0]
+    event_wavelet_idx = np.where((full_time >= start_time) & (full_time <= end_time))[0]
+    
+    # Calculate normalized power (relative to baseline)
+    normalized_cwt = np.zeros_like(cwtmatr)
+    for i in range(cwtmatr.shape[0]):
+        # Get baseline power for this frequency
+        if len(baseline_wavelet_idx) > 0:
+            baseline_power = np.mean(np.abs(cwtmatr[i, baseline_wavelet_idx]))
+            if baseline_power > 0:
+                # Calculate power relative to baseline (fold change)
+                normalized_cwt[i, :] = np.abs(cwtmatr[i, :]) / baseline_power
+            else:
+                normalized_cwt[i, :] = np.abs(cwtmatr[i, :])
+        else:
+            normalized_cwt[i, :] = np.abs(cwtmatr[i, :])
+    
+    # Plot wavelet scalogram (normalized)
+    pcm = ax_wavelet.pcolormesh(full_time, frequencies, normalized_cwt, 
+                               cmap=cmap, shading='gouraud', 
+                               vmin=0.5, vmax=5)  # Adjust scale to highlight power increases
+    
+    # Add vertical lines at event boundaries
+    ax_wavelet.axvline(start_time, color='white', linestyle='--')
+    ax_wavelet.axvline(end_time, color='white', linestyle='--')
+    
+    # Add colorbar
+    cbar = fig.colorbar(pcm, ax=ax_wavelet)
+    cbar.set_label('Power Relative to Baseline')
+    
+    # Focus on HFO frequency range
+    min_freq = 80
+    max_freq = 500
+    
+    # Check if we have enough high frequencies in our transform
+    if np.any(frequencies >= 250):
+        ax_wavelet.set_ylim([min_freq, max_freq])
+    else:
+        # If not, use available range
+        ax_wavelet.set_ylim([min_freq, max(frequencies)])
+    
+    ax_wavelet.set_title(f'{Chn_names[channel]} Wavelet Scalogram [{start_time:.2f}-{end_time:.2f}s]')
+    ax_wavelet.set_xlabel('Time (s)')
+    ax_wavelet.set_ylabel('Frequency (Hz)')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig, (ax_signal, ax_wavelet)

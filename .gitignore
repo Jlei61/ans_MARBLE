@@ -2,6 +2,8 @@ examples/
 preprocessed/
 outputs/
 results/
+temp_Figures/
+temp_Data/
 
 *.pt
 *.png

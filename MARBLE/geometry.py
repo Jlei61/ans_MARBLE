@@ -421,11 +421,34 @@ def manifold_dimension(Sigma, frac_explained=0.9):
     return int(dim_man)
 
 
-def fit_graph(x, graph_type="cknn", par=1, delta=1.0, metric="euclidean"):
-    """Fit graph to node positions"""
+def fit_graph(x, graph_type="cknn", par=10, delta=1.0, metric="euclidean", use_parallel=True):
+    """Fit graph to node positions
+    
+    Args:
+        x: Node positions
+        graph_type: Type of graph to construct ('cknn', 'knn', or 'radius')
+        par: Number of neighbors (k) for knn and cknn, or radius for radius graph
+        delta: Scaling parameter for cknn graph construction
+        metric: Distance metric to use
+        use_parallel: Whether to use parallel processing for large datasets
+        threshold: Minimum number of nodes to trigger parallel processing
+        
+    Returns:
+        edge_index: Edge indices of the graph
+        edge_weight: Edge weights based on inverse distance
+    """
+    num_nodes = x.shape[0]
 
     if graph_type == "cknn":
-        edge_index = cknneighbors_graph(x, n_neighbors=par, delta=delta, metric=metric).tocoo()
+        if use_parallel:
+            # For large datasets, use parallel computation
+            edge_index = cknneighbors_graph(
+                x, n_neighbors=par, delta=delta, metric=metric, n_jobs=-1
+            ).tocoo()
+        else:
+            edge_index = cknneighbors_graph(
+                x, n_neighbors=par, delta=delta, metric=metric
+            ).tocoo()
         edge_index = np.vstack([edge_index.row, edge_index.col])
         edge_index = utils.np2torch(edge_index, dtype="double")
 
@@ -443,9 +466,18 @@ def fit_graph(x, graph_type="cknn", par=1, delta=1.0, metric="euclidean"):
     assert is_connected(edge_index), "Graph is not connected! Try increasing k."
 
     edge_index = PyGu.to_undirected(edge_index)
-    pdist = torch.nn.PairwiseDistance(p=2)
-    edge_weight = pdist(x[edge_index[0]], x[edge_index[1]])
-    edge_weight = 1 / edge_weight
+    
+    # Faster edge weight calculation
+    src, dst = edge_index
+    if x.is_cuda:
+        # GPU implementation if available
+        edge_weight = torch.sqrt(torch.sum((x[src] - x[dst])**2, dim=1))
+    else:
+        # CPU implementation with potential SIMD optimizations
+        edge_weight = torch.linalg.norm(x[src] - x[dst], dim=1)
+    
+    # Avoid division by zero
+    edge_weight = 1.0 / (edge_weight + 1e-10)
 
     return edge_index, edge_weight
 
@@ -519,7 +551,7 @@ def compute_connection_laplacian(data, R, normalization="rw"):
     return Lc.coalesce()
 
 
-def compute_gauges(data, dim_man=None, n_geodesic_nb=10, processes=1):
+def compute_gauges(data, dim_man=None, n_geodesic_nb=10, processes=-1):
     """Orthonormal gauges for the tangent space at each node.
 
     Args:
@@ -529,7 +561,7 @@ def compute_gauges(data, dim_man=None, n_geodesic_nb=10, processes=1):
 
     Returns:
         gauges (nxdimxdim matrix): Matrix containing dim unit vectors for each node.
-        Sigma: Singular valued
+        Sigma: Singular values of the SVD of the geodesic distance matrix.
     """
     X = data.pos.numpy().astype(np.float64)
     A = PyGu.to_scipy_sparse_matrix(data.edge_index).tocsr()

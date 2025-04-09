@@ -31,6 +31,29 @@ def fun_vanderpol(par=None):
 
     return f, jac
 
+def fun_fhn(par=None):
+    """FitzHugh-Nagumo oscillator function definition"""
+    if par is None:
+        par = {
+                "a": 0.7,
+                "b": 0.8,
+                "tau": 12.5,
+                "I_ext": 0.5
+            }
+
+    def f(_, X):
+        x, y = X
+        dx = x - (x**3)/3 - y + par["I_ext"]
+        dy = (x + par["a"] - par["b"] * y) / par["tau"]
+        return [dx, dy]
+
+    def jac(_, X):
+        x, y = X
+        df1 = [1 - x**2, -1]
+        df2 = [1/par["tau"], -par["b"]/par["tau"]]
+        return [df1, df2]
+
+    return f, jac
 
 def load_ODE(whichmodel, par=None):
     """Load ODE system.
