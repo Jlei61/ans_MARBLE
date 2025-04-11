@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # FHN_MARBLE_demo.py - Simplified FitzHugh-Nagumo model analyzed with MARBLE
-
+import pickle
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,10 +10,19 @@ import torch
 import MARBLE
 from MARBLE import plotting, geometry
 import MARBLE.preprocessing as mprep
+import MARBLE.dynamics as dynamics
 
-# Create directories for results
-os.makedirs('temp_Figures', exist_ok=True)
-os.makedirs('temp_Data', exist_ok=True)
+def get_pos_vel(n_trajectories,params, t, area, alpha=0.05):
+    X0_range = dynamics.initial_conditions(n_trajectories, len(params), area)
+
+    pos, vel = [], []
+    for X0, m in zip(X0_range, params):
+        p, v = dynamics.simulate_vanderpol(m, X0, t)
+        pos.append(np.vstack(p))
+        vel.append(np.vstack(v))
+
+    pos, vel = dynamics.embed_parabola(pos, vel, alpha=alpha)
+    return pos, vel
 
 # Set random seed for reproducibility
 np.random.seed(42)
@@ -34,215 +43,172 @@ MARBLE_PARAMS = {
     'momentum': 0.9,
     'diffusion': True,
     'hidden_channels': [64, 32],
-    'out_channels': 2,
+    'out_channels': 5,
     'batch_norm': True,
     'seed': 42
 }
 
-def fun_fhn(par=None):
-    """FitzHugh-Nagumo oscillator function definition"""
-    if par is None:
-        par = FHN_PARAMS.copy()
+print("Simplified FitzHugh-Nagumo MARBLE Demo")
+print("=" * 40)
 
-    def f(_, X):
-        x, y = X
-        dx = x - (x**3)/3 - y + par["I_ext"]
-        dy = (x + par["a"] - par["b"] * y) / par["tau"]
-        return [dx, dy]
+# Setup
+n_trajectories = 100  # Number of trajectories to simulate
+ntime = 100
+t_span = np.linspace(0, 10, ntime)  # Time points
+area = [[-2.0, -4.], [2.0, .0]]
 
-    def jac(_, X):
-        x, y = X
-        df1 = [1 - x**2, -1]
-        df2 = [1/par["tau"], -par["b"]/par["tau"]]
-        return [df1, df2]
+# Parameter to vary (set to None for fixed parameters)
+vary_param = 'b'
+param_range = [1.25, 1.8]
+n_params = 50
+params = np.linspace(param_range[0], param_range[1], n_params)
 
-    return f, jac
+print(f"Generating {n_trajectories} trajectories...")
 
-def solve_ode(f, jac, t, x0):
-    """Solve ODE system"""
-    x = odeint(f, x0, t, Dfun=jac, tfirst=True)
-    xprime = np.array([f(t_, x_) for t_, x_ in zip(t, x)])
-    return x, xprime
+os.makedirs(f'temp_Figures/fhn_{vary_param}', exist_ok=True)
+os.makedirs(f'temp_Data/fhn_{vary_param}', exist_ok=True)
 
-def sample_2d(N=100, interval=None, method="random", seed=0):
-    """Sample N points in a 2D area."""
-    if interval is None:
-        interval = [[-2.0, -0.8], [2.0, 2.0]]
-    
-    np.random.seed(seed)
-    x = np.random.uniform(
-        (interval[0][0], interval[0][1]), 
-        (interval[1][0], interval[1][1]), 
-        (N, 2)
-    )
-    return x
+pos_list,vel_list = get_pos_vel(n_trajectories,params, t_span, area,alpha=0.05)
 
-def initial_conditions(n, reps, area=None, seed=42):
-    """Generate initial conditions"""
-    if area is None:
-        area = [[-2.0, -0.8], [2.0, 2.0]]
-    X0_range = [sample_2d(1, area, "random", seed=i + seed) for i in range(n * reps)]
-    return X0_range
+# Plot phase space trajectories for 5 sampled parameters
+plt.figure(figsize=(10, 8))
+scatter = None
 
-def simulate_fhn(params, X0_list, t, vary_param=None, param_range=None):
-    """Simulate FHN model for multiple initial conditions"""
-    pos_list, vel_list, param_list = [], [], []
-    
-    for i, X0 in enumerate(X0_list):
-        # If varying a parameter, assign unique value to this trajectory
-        if vary_param and param_range:
-            traj_params = params.copy()
-            param_val = np.random.uniform(param_range[0], param_range[1])
-            traj_params[vary_param] = param_val
-            param_list.append(param_val)
-        else:
-            traj_params = params
-            param_list.append(0)  # Default value if not varying
-            
-        # Get system equations
-        f, jac = fun_fhn(traj_params)
-        
-        # Solve ODE
-        X0_flat = X0.flatten()  # Ensure X0 is 1D array
-        pos, vel = solve_ode(f, jac, t, X0_flat)
-        
-        pos_list.append(pos)
-        vel_list.append(vel)
+# Sample 5 evenly spaced parameter indices
+sample_indices = np.linspace(0, n_params-1, 10, dtype=int)
+colors = plt.cm.viridis(np.linspace(0, 1, 10))
 
-    return pos_list, vel_list, np.array(param_list)
+for idx, param_idx in enumerate(sample_indices):
+    scatter = plt.scatter(pos_list[param_idx][:, 0], pos_list[param_idx][:, 1],
+                         c=colors[idx], alpha=0.7, s=1)
+plt.colorbar()
+plt.title('FHN Phase Space Trajectories for Selected Parameter Values')
+plt.xlabel('Voltage (x)')
+plt.ylabel('Recovery (y)')
+plt.legend()
+plt.savefig(f'temp_Figures/fhn_{vary_param}/phase_space_trajectories.png', dpi=300, bbox_inches='tight')
+plt.show()
 
-def prepare_marble_dataset(pos_list, vel_list, param_list, k=100):
-    """Prepare data for MARBLE training"""
-    print("Preparing MARBLE dataset...")
-    
-    # Construct the dataset
-    data = MARBLE.construct_dataset(
-        anchor=pos_list, 
-        vector=vel_list,
-        k=k,  # Number of nearest neighbors
-        # number_of_eigenvectors=5,
-        number_of_resamples=0,
-    )
+# Plot time series for variable x
+plt.figure(figsize=(12, 6))
+for idx, param_idx in enumerate(sample_indices[:]):
+    x_timeseries = pos_list[param_idx][:, 0]  # Extract x variable
+    plt.plot(t_span, x_timeseries[param_idx*ntime:(param_idx+1)*ntime], color=colors[idx], 
+             label=f'{vary_param}={params[param_idx]:.2f}')
 
-    # Store parameter values
-    param_values = np.zeros(data.x.shape[0])
-    traj_indices = np.zeros(data.x.shape[0], dtype=int)
+plt.title('Time Series of Voltage Variable (x) for Different Parameter Values')
+plt.xlabel('Time')
+plt.ylabel('Voltage (x)')
+plt.legend()
+plt.savefig(f'temp_Figures/fhn_{vary_param}/voltage_timeseries.png', dpi=300, bbox_inches='tight')
+plt.show()
 
-    start_idx = 0
-    for i, sample_indices in enumerate(data.sample_ind.split(data.num_nodes.tolist())):
-        param_val = param_list[i]
-        end_idx = start_idx + len(sample_indices)
-        param_values[start_idx:end_idx] = param_val
-        traj_indices[start_idx:end_idx] = i
-        start_idx = end_idx
+# Create bifurcation plot using the utility function
+from fhn_phase_plane_utils import *
 
-    data.param_values = torch.tensor(param_values, dtype=torch.float32)
-    data.traj_indices = torch.tensor(traj_indices, dtype=torch.long)
-    
-    print(f"Created dataset with {data.x.shape[0]} points and {data.edge_index.shape[1]} edges")
-    return data
+# Setup other parameters (all parameters except the one we're varying)
+other_params = FHN_PARAMS.copy()
+del other_params[vary_param]  # Remove the parameter we're varying
 
-def train_marble_model(data):
-    """Train MARBLE model on dataset"""
-    print("Training MARBLE model...")
-    
-    # Create and train model
-    model = MARBLE.net(data, params=MARBLE_PARAMS, verbose=True)
-    model.fit(data, verbose=True)
+# Call the bifurcation diagram function
+fig, axes = plot_bifurcation_diagram(
+    param_name=vary_param,
+    param_range=param_range,
+    other_params=other_params,
+    num_points=n_params,
+    figsize=(10, 6),
+    y_lim=[-5, 5],
+    n_jobs= -1,
+)
 
-    # Plot training loss
-    plt.figure(figsize=(8, 4))
-    plt.plot(model.losses['train_loss'], label='Training')
-    plt.plot(model.losses['val_loss'], label='Validation')
-    plt.title('MARBLE Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('temp_Figures/marble_training_loss.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return model
+# Save the bifurcation diagram
+plt.savefig(f'temp_Figures/fhn_{vary_param}/bifurcation_diagram_{vary_param}.png', dpi=300, bbox_inches='tight')
+plt.show()
 
-def visualize_embeddings(model, data):
-    """Visualize MARBLE embeddings"""
-    print("Visualizing embeddings...")
-    
-    # Transform data to get embeddings
-    embedded_data = model.transform(data)
-    embeddings = embedded_data.emb.numpy()
-    param_values = data.param_values.numpy()
-    
-    # Plot embeddings colored by parameter
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(embeddings[:, 0], embeddings[:, 1], 
-                         c=param_values, cmap='viridis', alpha=0.5, s=5)
-    plt.xlabel('Embedding Dimension 1')
-    plt.ylabel('Embedding Dimension 2')
-    plt.colorbar(scatter, label='Parameter value')
-    plt.title('MARBLE Embeddings of FHN Dynamics')
-    plt.grid(True)
-    plt.savefig('temp_Figures/fhn_embeddings.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Plot original phase space colored by first embedding dimension
-    plt.figure(figsize=(8, 6))
-    scatter = plt.scatter(data.pos[:, 0].numpy(), data.pos[:, 1].numpy(), 
-                         c=embeddings[:, 0], cmap='coolwarm', s=5, alpha=0.5)
-    plt.xlabel('Voltage (x)')
-    plt.ylabel('Recovery (y)')
-    plt.title('State Space Colored by Embedding Dim 1')
-    plt.grid(True)
-    plt.colorbar(scatter, label='Embedding Dim 1')
-    plt.savefig('temp_Figures/state_space_colored.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return embeddings
+# Create phase plane plots for different parameter values
+param_values = np.linspace(param_range[0], param_range[1], 6)  # Sample 6 values
+fig = parameter_sweep_phase_planes(
+    param_name=vary_param,
+    param_values=param_values,
+    other_params=other_params,
+    x_range=[-2.5, 2.5],
+    y_range=[-1.0, 2.5],
+    figsize=(15, 10)
+)
 
-# Main execution
-if __name__ == "__main__":
-    print("Simplified FitzHugh-Nagumo MARBLE Demo")
-    print("=" * 40)
-    
-    # Setup
-    n_trajectories = 100  # Number of trajectories to simulate
-    t_span = np.linspace(0, 100, 1000)  # Time points
-    
-    # Parameter to vary (set to None for fixed parameters)
-    vary_param = 'b'
-    param_range = [0.5, 1.5]
-    
-    print(f"Generating {n_trajectories} trajectories...")
-    if vary_param:
-        print(f"Varying parameter: {vary_param} in range {param_range}")
-    
-    # Generate initial conditions
-    X0_list = initial_conditions(n_trajectories, 1)
-    
-    # Simulate FHN model
-    pos_list, vel_list, param_list = simulate_fhn(
-        FHN_PARAMS, X0_list, t_span, 
-        vary_param=vary_param, 
-        param_range=param_range
-    )
-    
-    # Visualize sample trajectories
-    plt.figure(figsize=(8, 6))
-    for i in range(min(10, n_trajectories)):
-        plt.plot(pos_list[i][:, 0], pos_list[i][:, 1], alpha=0.7)
-    plt.title('Sample FHN Trajectories')
-    plt.xlabel('Voltage (x)')
-    plt.ylabel('Recovery (y)')
-    plt.grid(True)
-    plt.savefig('temp_Figures/fhn_sample_trajectories.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Prepare dataset and train model
-    data = prepare_marble_dataset(pos_list, vel_list, param_list)
-    model = train_marble_model(data)
-    
-    # Visualize results
-    embeddings = visualize_embeddings(model, data)
-    
-    print("=" * 40)
-    print("Demo completed. Results saved to temp_Figures/ directory.") 
+# Save the phase plane plots
+plt.savefig(f'temp_Figures/fhn_{vary_param}/phase_planes_{vary_param}.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Example usage - track eigenvalues for a point near b=1.2
+point_near_transition = [1.0, 0.0]  # Starting point to track (x,y)
+fig, axes = plot_eigenvalue_movement(vary_param,param_range, point_near_transition, FHN_PARAMS)
+# Save the eigenvalue movement plot
+plt.savefig(f'temp_Figures/fhn_{vary_param}/eigenvalue_movement_{vary_param}.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+load_dataset = False 
+load_model = False
+save_path = f'temp_Data/fhn_{vary_param}/fhn_dataset_{vary_param}.pkl'
+model_path = f'temp_Data/fhn_{vary_param}/fhn_model_{vary_param}.pkl'
+
+# Prepare dataset and train model
+if not load_dataset:
+    data = MARBLE.construct_dataset(anchor=pos_list, vector=vel_list, spacing=0.03)
+    with open(save_path, 'wb') as f:
+        pickle.dump(data, f)
+    print(f"Dataset saved to {save_path}")
+else:
+    with open(save_path, 'rb') as f:
+        data = pickle.load(f)
+    print(f"Dataset loaded from {save_path}")
+
+model = MARBLE.net(data, params=MARBLE_PARAMS)
+
+if not load_model:
+    model.fit(data, outdir='temp_Data')
+    # Save the trained model
+    with open(model_path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"Model saved to {model_path}")
+else:
+    # Load the trained model
+    with open(model_path, 'rb') as f:
+        model = pickle.load(f)
+    print(f"Model loaded from {model_path}")
+
+# Transform data and calculate distances
+data = model.transform(data)
+data = MARBLE.distribution_distances(data)
+data = MARBLE.embed_in_2D(data)
+
+# Visualize embeddings
+plt.figure(figsize=(4, 4))
+ax = plotting.embedding(data, params[data.y.numpy().astype(int)])
+
+plt.savefig(f'temp_Figures/fhn_{vary_param}/embedding_{vary_param}.png', dpi=300, bbox_inches='tight')
+plt.show()
+# Plot distance matrix
+plt.figure(figsize=(6.4, 4.8))
+im = plt.imshow(data.dist, extent=[params[0], params[-1], params[-1], params[0]])
+plt.colorbar(im)
+plt.title('Distance Matrix')
+plt.xlabel('Parameter Value')
+plt.ylabel('Parameter Value')
+plt.tight_layout()
+plt.savefig(f'temp_Figures/fhn_distances_{vary_param}.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Plot different embeddings
+embed_types = ['PCA', 'tsne', 'umap', 'Isomap', 'MDS']
+
+for embed_typ in embed_types:
+    emb, _ = geometry.embed(data.dist, embed_typ=embed_typ)
+    plt.figure(figsize=(4, 4))
+    ax = plotting.embedding(emb, params, s=30, alpha=1)
+    plt.title(f'{embed_typ} Embedding')
+    plt.savefig(f'temp_Figures/fhn_{vary_param}/{embed_typ.lower()}_{vary_param}.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+print("=" * 40)
+print("Demo completed. Results saved to temp_Figures/ directory.")
