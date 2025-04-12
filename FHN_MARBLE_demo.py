@@ -59,8 +59,8 @@ area = [[-2.0, -4.], [2.0, .0]]
 
 # Parameter to vary (set to None for fixed parameters)
 vary_param = 'b'
-param_range = [1.25, 1.8]
-n_params = 50
+param_range = [-.1, 2.8]
+n_params = 100
 params = np.linspace(param_range[0], param_range[1], n_params)
 
 print(f"Generating {n_trajectories} trajectories...")
