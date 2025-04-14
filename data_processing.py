@@ -7,6 +7,7 @@ from glob import glob
 from typing import List, Tuple, Optional, Union
 import torch
 import sys
+from scipy.signal import butter, filtfilt
 
 # Add the path to bqk_utils.py to make the functions available
 sys.path.append('.')
@@ -310,7 +311,7 @@ def load_merged_data(
             # Generate time array for this file
             n_samples = file_data.shape[1]
             sfreq = raw.info['sfreq']
-            time_array = generate_time_array(timestamp, n_samples, sfreq, reference_time, cyclic_24h=True)
+            time_array = generate_time_array(timestamp, n_samples, sfreq, reference_time, cyclic_24h=False)
             
             # Detect events if requested
             if label_type == "event":
@@ -714,3 +715,339 @@ def find_preprocessed_datasets(
             print(f"  {i+1}. {basename}")
     
     return file_paths
+
+def load_bandpower_data(
+    data_dir: str,
+    max_samples: int,
+    batch_size: int = -1,
+    max_files: int = None,
+    start_file_idx: int = 0,
+    file_pattern: str = "*.fif",
+    reference_time: Optional[datetime.datetime] = None,
+    label_type: str = "event",
+    save_data: bool = False,
+    save_dir: str = "temp_Data",
+    band_range: List[float] = [80, 250],
+    window_size_ms: float = 20,
+    overlap: float = 0.5,
+    label_params: Optional[dict] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Load and extract band power from EEG data using sliding windows.
+    
+    Args:
+        data_dir: Directory containing the EEG files
+        max_samples: Number of samples per batch for the band power features
+        batch_size: Number of batches to create. If -1, creates as many as possible
+        max_files: Maximum number of files to read (optional). If None, reads all files.
+        start_file_idx: Index of the file to start loading from
+        file_pattern: Pattern to match files
+        reference_time: Reference time for time array (default: 7:00 AM of the first file's day)
+        label_type: Type of labels to use - options: "time", "event", "custom"
+        save_data: Whether to save the preprocessed data
+        save_dir: Directory to save the preprocessed data
+        band_range: Frequency band for extraction [low, high]
+        window_size_ms: Size of sliding window in milliseconds
+        overlap: Overlap ratio between windows (0 to 1)
+        label_params: Parameters for label generation (e.g., event detection parameters)
+        
+    Returns:
+        Tuple containing:
+            - Band power data (n_batch, n_windows, n_channels)
+            - Labels (n_batch, n_windows)
+            - File indices used in this batch
+            - Next file index to start from
+    """
+    files = sorted(glob(os.path.join(data_dir, file_pattern)))
+    
+    if not files:
+        raise ValueError(f"No files found in {data_dir} matching pattern {file_pattern}")
+    
+    if start_file_idx >= len(files):
+        raise ValueError(f"Start file index {start_file_idx} exceeds available files ({len(files)})")
+    
+    # Apply max_files limit if specified
+    if max_files is not None:
+        available_files = files[start_file_idx:start_file_idx + max_files]
+    else:
+        available_files = files[start_file_idx:]
+    
+    print(f"Found {len(available_files)} available files to process")
+    
+    # Initialize data collection for batches
+    batch_data_list = []
+    batch_times_list = []
+    batch_events_list = []
+    used_file_indices = []
+    
+    # Track start and end timestamps for all processed files
+    start_timestamp = None
+    end_timestamp = None
+    
+    # Start from the provided file index
+    file_idx = start_file_idx
+    batch_idx = 0
+    
+    # Default event detection parameters
+    default_event_params = {
+        'freq_band': [250, 451],
+        'rel_thresh': 3.0,
+        'abs_thresh': 3.0,
+        'min_gap': 20,
+        'min_last': 20
+    }
+    
+    # Update with user-provided parameters
+    if label_params and label_type == "event":
+        default_event_params.update(label_params)
+    
+    def extract_band_power(data, sfreq, band_range, window_size_ms, overlap):
+        """Helper function to extract band power using sliding windows"""
+        n_channels = data.shape[0]
+        
+        # Calculate window size in samples
+        window_samples = int((window_size_ms / 1000) * sfreq)
+        
+        # Check if window is large enough for filtering
+        # The minimum window size for filtfilt is typically 3*(filter_order*2 + 1)
+        # Using a 4th order filter, this requires at least 3*(4*2+1) = 27 samples
+        min_window_size = 30  # Slightly larger than the minimum to be safe
+        
+        if window_samples < min_window_size:
+            print(f"Warning: Window size too small for filtering ({window_samples} samples).")
+            print(f"Increasing window size from {window_size_ms}ms to {min_window_size/sfreq*1000:.1f}ms")
+            window_samples = min_window_size
+            window_size_ms = (window_samples / sfreq) * 1000
+        
+        # Calculate step size based on overlap
+        step_size = max(1, int(window_samples * (1 - overlap)))
+        
+        # Calculate number of windows
+        n_samples = data.shape[1]
+        n_windows = (n_samples - window_samples) // step_size + 1
+        
+        # Design bandpass filter
+        nyquist = sfreq / 2
+        filter_order = 2  # Lower the filter order for better stability with short windows
+        b, a = butter(filter_order, [band_range[0] / nyquist, band_range[1] / nyquist], btype='band')
+        
+        # Initialize band power matrix
+        band_power = np.zeros((n_windows, n_channels))
+        window_times = np.zeros(n_windows)
+        
+        # Process each window
+        for i in range(n_windows):
+            # Extract window
+            start_idx = i * step_size
+            end_idx = start_idx + window_samples
+            
+            # Skip if we're at the end of the data
+            if end_idx > n_samples:
+                break
+                
+            window = data[:, start_idx:end_idx]
+            
+            # Apply bandpass filter - handle channels separately
+            filtered_window = np.zeros_like(window)
+            for ch in range(n_channels):
+                filtered_window[ch] = filtfilt(b, a, window[ch])
+            
+            # Calculate band power (mean squared amplitude)
+            power = np.mean(filtered_window ** 2, axis=1)
+            band_power[i, :] = power
+            
+            # Store the central time point of the window
+            window_times[i] = (start_idx + window_samples // 2) / sfreq
+        
+        return band_power, window_times
+    
+    # Process batches until we reach batch_size or run out of files
+    while (batch_size == -1 or batch_idx < batch_size) and file_idx < start_file_idx + len(available_files):
+        print(f"Processing batch {batch_idx+1}")
+        current_windows = 0
+        batch_file_indices = []
+        
+        # Reset data for new batch
+        current_data = None
+        current_times = None
+        current_events = None
+        
+        # Keep adding files until we reach max_samples (windows)
+        while current_windows < max_samples and file_idx < start_file_idx + len(available_files):
+            file = available_files[file_idx - start_file_idx]
+            print(f"  Loading file: {os.path.basename(file)}")
+            
+            # Parse the timestamp from the filename
+            timestamp = parse_timestamp_from_filename(file)
+            
+            # Update start and end timestamps
+            if start_timestamp is None or timestamp < start_timestamp:
+                start_timestamp = timestamp
+            if end_timestamp is None or timestamp > end_timestamp:
+                end_timestamp = timestamp
+            
+            # If reference_time is not set and this is the first file, set it to 7 AM of this day
+            if reference_time is None and batch_idx == 0 and current_data is None:
+                reference_time = datetime.datetime(
+                    timestamp.year, timestamp.month, timestamp.day, 7, 0, 0
+                )
+                print(f"Setting reference time to: {reference_time}")
+            
+            # Load the raw data
+            raw = mne.io.read_raw_fif(file, preload=True, verbose=False)
+            
+            # Get data and convert to numpy array
+            file_data = raw.get_data()  # Channels x Time
+            
+            # Get sampling frequency
+            sfreq = raw.info['sfreq']
+            
+            # Extract band power using sliding windows
+            band_power, window_times = extract_band_power(
+                file_data, sfreq, band_range, window_size_ms, overlap
+            )
+            
+            # Adjust window times to be relative to reference time
+            if reference_time:
+                # Calculate offset in seconds
+                time_offset = (timestamp - reference_time).total_seconds()
+                window_times += time_offset
+            
+            # Detect events if requested
+            if label_type == "event":
+                try:
+                    # For event detection, we'll use the raw data
+                    params = default_event_params.copy()
+                    params['start_time'] = (timestamp - reference_time).total_seconds() if reference_time else 0
+                    event_array = detect_interictal_events(
+                        file_data, 
+                        sfreq,
+                        raw.ch_names, 
+                        **params
+                    )
+                    
+                    # Map event array to windows
+                    window_events = np.zeros(len(window_times))
+                    for i, window_time in enumerate(window_times):
+                        # Calculate the sample index in the original data
+                        central_sample_idx = int((window_time - time_offset) * sfreq)
+                        
+                        # Use a small window around the central point to check for events
+                        half_window = int(window_size_ms * sfreq / 2000)  # Half window in samples
+                        start_sample = max(0, central_sample_idx - half_window)
+                        end_sample = min(len(event_array), central_sample_idx + half_window)
+                        
+                        # If any sample in the window has an event, mark the window
+                        if np.any(event_array[start_sample:end_sample] > 0):
+                            window_events[i] = 1
+                    
+                except Exception as e:
+                    print(f"Error detecting events: {e}")
+                    print("Using zeros as events")
+                    window_events = np.zeros(len(window_times))
+            
+            if current_data is None:
+                current_data = band_power
+                current_times = window_times
+                if label_type == "event":
+                    current_events = window_events
+            else:
+                # Concatenate along the window dimension (axis=0)
+                current_data = np.concatenate([current_data, band_power], axis=0)
+                current_times = np.concatenate([current_times, window_times])
+                if label_type == "event":
+                    current_events = np.concatenate([current_events, window_events])
+            
+            batch_file_indices.append(file_idx)
+            file_idx += 1
+            
+            # Update current_windows
+            current_windows = current_data.shape[0]
+            
+            # If we've reached max_samples, or even exceeded it, break
+            if current_windows >= max_samples:
+                break
+                
+            # If we've processed all available files, break
+            if file_idx >= start_file_idx + len(available_files):
+                print(f"  Reached end of files at batch {batch_idx+1}")
+                break
+        
+        # If we didn't get any data for this batch, break
+        if current_data is None:
+            print(f"No more data available for batch {batch_idx+1}")
+            break
+            
+        # If we didn't get enough data for a complete batch, pad with zeros
+        if current_windows < max_samples:
+            print(f"  Warning: Batch {batch_idx+1} is incomplete with {current_windows}/{max_samples} windows")
+            pad_windows = max_samples - current_windows
+            current_data = np.pad(current_data, ((0, pad_windows), (0, 0)), mode='constant')
+            
+            # Pad times by continuing the time sequence
+            if current_times is not None and len(current_times) > 0:
+                last_time = current_times[-1]
+                # Estimate time step from data
+                time_step = (window_size_ms / 1000) * (1 - overlap) if len(current_times) > 1 else 0.01
+                pad_times = last_time + np.arange(1, pad_windows + 1) * time_step
+                current_times = np.concatenate([current_times, pad_times])
+            
+            # Pad events with zeros
+            if label_type == "event" and current_events is not None:
+                current_events = np.pad(current_events, (0, pad_windows), mode='constant')
+        
+        # If we have more than max_samples windows, trim
+        if current_windows > max_samples:
+            current_data = current_data[:max_samples, :]
+            current_times = current_times[:max_samples]
+            if label_type == "event":
+                current_events = current_events[:max_samples]
+        
+        # Add to batch lists
+        batch_data_list.append(current_data)
+        batch_times_list.append(current_times)
+        if label_type == "event":
+            batch_events_list.append(current_events)
+        used_file_indices.extend(batch_file_indices)
+        
+        batch_idx += 1
+        
+        # If we've processed all files, break
+        if file_idx >= start_file_idx + len(available_files):
+            break
+    
+    # Convert lists to arrays
+    batched_data = np.array(batch_data_list)
+    
+    # Process time arrays or events into labels based on label_type
+    if label_type == "event":
+        batched_labels = np.array(batch_events_list)
+        # Add channel dimension if needed
+        if len(batched_labels.shape) == 2:
+            batched_labels = batched_labels[:, :, np.newaxis]
+        print(f"Created event-based labels with shape: {batched_labels.shape}")
+    else:
+        # Use time arrays as labels
+        batched_labels = np.array([times[:, np.newaxis] for times in batch_times_list])
+        print(f"Created time-based labels with shape: {batched_labels.shape}")
+    
+    print(f"Loaded {len(batch_data_list)} batches with shape: {batched_data.shape}")
+    
+    # Save the preprocessed data if requested
+    if save_data and start_timestamp is not None and end_timestamp is not None:
+        # Create filename indicating this is bandpower data
+        start_str = start_timestamp.strftime("%Y%m%d_%H%M%S")
+        end_str = end_timestamp.strftime("%Y%m%d_%H%M%S")
+        filename = f"{start_str}_{end_str}_bandpower_{band_range[0]}-{band_range[1]}Hz_PreMARBLE_dataset.npz"
+        filepath = os.path.join(save_dir, filename)
+        
+        # Create the save directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Save data and labels
+        np.savez(filepath, data=batched_data, labels=batched_labels, 
+                band_range=band_range, window_size_ms=window_size_ms, overlap=overlap)
+        
+        print(f"Saved bandpower data to {filepath}")
+    
+    return batched_data, batched_labels, np.array(used_file_indices), file_idx

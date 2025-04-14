@@ -1,95 +1,12 @@
 """Preprocessing module."""
 
 import torch
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
 from torch_geometric.data import Batch
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomNodeSplit
 
 from MARBLE import geometry as g
 from MARBLE import utils
-
-
-def _process_data_item(
-    item_tuple, 
-    number_of_resamples, 
-    spacing, 
-    Sampling, 
-    graph_type, 
-    k, 
-    delta, 
-    metric, 
-    use_parallel, 
-    seed=None
-):
-    """Process a single data item for parallel execution.
-    
-    Args:
-        item_tuple: Tuple of (index, anchor, vector, label, mask)
-        number_of_resamples: Number of resampling runs
-        spacing: Stopping criterion for furthest point sampling
-        Sampling: Whether to use sampling
-        graph_type: Type of graph to construct
-        k: Number of neighbors
-        delta: Delta parameter for graph construction
-        metric: Distance metric
-        use_parallel: Whether to use parallel graph fitting
-        seed: Random seed
-        
-    Returns:
-        List of processed Data objects
-    """
-    i, a, v, l, m = item_tuple
-    result_data = []
-    
-    for _ in range(number_of_resamples):
-        if len(a) != 0:
-            # Apply sampling only if enabled
-            if Sampling:
-                # even sampling of points
-                if seed is None:
-                    start_idx = torch.randint(low=0, high=len(a), size=(1,))
-                else:
-                    start_idx = 0
-
-                sample_ind, _ = g.furthest_point_sampling_memory_efficient(a, spacing=spacing, start_idx=start_idx)
-                sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
-                a_, v_, l_, m_ = (
-                    a[sample_ind],
-                    v[sample_ind],
-                    l[sample_ind],
-                    m[sample_ind],
-                )
-            else:
-                # Use all points without sampling
-                a_, v_, l_, m_ = a, v, l, m
-                sample_ind = torch.arange(len(a))
-
-            # fit graph to point cloud
-            edge_index, edge_weight = g.fit_graph(
-                a_, graph_type=graph_type, par=k, delta=delta, metric=metric, use_parallel=use_parallel
-            )
-
-            # define data object
-            num_node_features = v.shape[1]
-            data_ = Data(
-                pos=a_,
-                x=v_,
-                label=l_,
-                mask=m_,
-                edge_index=edge_index,
-                edge_weight=edge_weight,
-                num_nodes=len(a_),
-                num_node_features=num_node_features,
-                y=torch.ones(len(a_), dtype=int) * i,
-                sample_ind=sample_ind,
-            )
-
-            result_data.append(data_)
-    
-    return result_data
 
 
 def construct_dataset(
@@ -110,8 +27,6 @@ def construct_dataset(
     number_of_eigenvectors=None,
     use_parallel=True,
     Sampling=False,
-    parallel_processing=False,
-    n_jobs=None,
 ):
     """Construct PyG dataset from node positions and features.
 
@@ -136,8 +51,6 @@ def construct_dataset(
         metric: metric used to fit proximity graph
         number_of_eigenvectors: int number of eigenvectors to use. Default: None, meaning use all.
         Sampling: whether to use sampling strategy. Default: False
-        parallel_processing: whether to use parallel processing for data preparation. Default: False
-        n_jobs: number of parallel jobs. Default: None (use all available cores)
     """
 
     anchor = [torch.tensor(a).float() for a in utils.to_list(anchor)]
@@ -159,82 +72,66 @@ def construct_dataset(
         number_of_resamples = 1
 
     data_list = []
+    total_samples = 0
+    ignored_samples = 0
     
-    if parallel_processing and len(anchor) > 1:
-        print(f"Using parallel processing with {n_jobs or multiprocessing.cpu_count()} workers")
-        # Prepare data for parallel processing
-        items = [(i, a, v, l, m) for i, (a, v, l, m) in enumerate(zip(anchor, vector, label, mask))]
-        
-        # Create a partial function with fixed parameters
-        process_func = partial(
-            _process_data_item,
-            number_of_resamples=number_of_resamples,
-            spacing=spacing,
-            Sampling=Sampling,
-            graph_type=graph_type,
-            k=k,
-            delta=delta,
-            metric=metric,
-            use_parallel=use_parallel,
-            seed=seed
-        )
-        
-        # Process data in parallel
-        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-            futures = [executor.submit(process_func, item) for item in items]
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    data_list.extend(result)
-                except Exception as exc:
-                    print(f"An exception occurred during parallel processing: {exc}")
-    else:
-        # Original sequential processing
-        for i, (a, v, l, m) in enumerate(zip(anchor, vector, label, mask)):
-            for _ in range(number_of_resamples):
-                if len(a) != 0:
-                    # Apply sampling only if enabled
-                    if Sampling:
-                        # even sampling of points
-                        if seed is None:
-                            start_idx = torch.randint(low=0, high=len(a), size=(1,))
-                        else:
-                            start_idx = 0
-
-                        sample_ind, _ = g.furthest_point_sampling_memory_efficient(a, spacing=spacing, start_idx=start_idx)
-                        sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
-                        a_, v_, l_, m_ = (
-                            a[sample_ind],
-                            v[sample_ind],
-                            l[sample_ind],
-                            m[sample_ind],
-                        )
+    for i, (a, v, l, m) in enumerate(zip(anchor, vector, label, mask)):
+        for _ in range(number_of_resamples):
+            if len(a) != 0:
+                total_samples += 1
+                
+                # Apply sampling only if enabled
+                if Sampling:
+                    # even sampling of points
+                    if seed is None:
+                        start_idx = torch.randint(low=0, high=len(a), size=(1,))
                     else:
-                        # Use all points without sampling
-                        a_, v_, l_, m_ = a, v, l, m
-                        sample_ind = torch.arange(len(a))
+                        start_idx = 0
 
-                    # fit graph to point cloud
-                    edge_index, edge_weight = g.fit_graph(
-                        a_, graph_type=graph_type, par=k, delta=delta, metric=metric, use_parallel=use_parallel
+                    sample_ind, _ = g.furthest_point_sampling_memory_efficient(a, spacing=spacing, start_idx=start_idx)
+                    sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
+                    a_, v_, l_, m_ = (
+                        a[sample_ind],
+                        v[sample_ind],
+                        l[sample_ind],
+                        m[sample_ind],
                     )
+                else:
+                    # Use all points without sampling
+                    a_, v_, l_, m_ = a, v, l, m
+                    sample_ind = torch.arange(len(a))
 
-                    # define data object
-                    data_ = Data(
-                        pos=a_,
-                        x=v_,
-                        label=l_,
-                        mask=m_,
-                        edge_index=edge_index,
-                        edge_weight=edge_weight,
-                        num_nodes=len(a_),
-                        num_node_features=num_node_features,
-                        y=torch.ones(len(a_), dtype=int) * i,
-                        sample_ind=sample_ind,
-                    )
+                # fit graph to point cloud
+                edge_index, edge_weight = g.fit_graph(
+                    a_, graph_type=graph_type, par=k, delta=delta, metric=metric, use_parallel=use_parallel
+                )
+                
+                # Skip this sample if the graph is not connected
+                if edge_index is None:
+                    ignored_samples += 1
+                    continue
 
-                    data_list.append(data_)
+                # define data object
+                data_ = Data(
+                    pos=a_,
+                    x=v_,
+                    label=l_,
+                    mask=m_,
+                    edge_index=edge_index,
+                    edge_weight=edge_weight,
+                    num_nodes=len(a_),
+                    num_node_features=num_node_features,
+                    y=torch.ones(len(a_), dtype=int) * i,
+                    sample_ind=sample_ind,
+                )
 
+                data_list.append(data_)
+    
+    if ignored_samples > 0:
+        print(f"\n---- Ignored {ignored_samples} out of {total_samples} samples due to unconnected graphs with k={k}")
+        if len(data_list) == 0:
+            raise ValueError(f"All samples resulted in unconnected graphs with k={k}. Try increasing k or adjusting other parameters.")
+            
     # collate datasets
     batch = Batch.from_data_list(data_list)
     batch.degree = k

@@ -431,11 +431,10 @@ def fit_graph(x, graph_type="cknn", par=10, delta=1.0, metric="euclidean", use_p
         delta: Scaling parameter for cknn graph construction
         metric: Distance metric to use
         use_parallel: Whether to use parallel processing for large datasets
-        threshold: Minimum number of nodes to trigger parallel processing
         
     Returns:
-        edge_index: Edge indices of the graph
-        edge_weight: Edge weights based on inverse distance
+        edge_index: Edge indices of the graph, or None if graph is not connected
+        edge_weight: Edge weights based on inverse distance, or None if graph is not connected
     """
     num_nodes = x.shape[0]
 
@@ -463,7 +462,8 @@ def fit_graph(x, graph_type="cknn", par=10, delta=1.0, metric="euclidean", use_p
     else:
         raise NotImplementedError
 
-    assert is_connected(edge_index), "Graph is not connected! Try increasing k."
+    if not is_connected(edge_index):
+        return None, None  # Return None if graph is not connected
 
     edge_index = PyGu.to_undirected(edge_index)
     
