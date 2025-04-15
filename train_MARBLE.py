@@ -35,9 +35,23 @@ band_range = [80, 250]  # Frequency band for extraction [low, high] in Hz
 window_size_ms = 100  # Window size in milliseconds (increased from 20ms to avoid filtering issues)
 overlap = 0.5  # Overlap ratio between windows
 
+
+# Define flags for loading saved data/model
+load_dataset = False 
+load_model = False
+
 if load_dataset:
     # Find available preprocessed datasets
-    dataset_files = find_preprocessed_datasets(save_dir)
+    if use_bandpower:
+        # Look specifically for bandpower datasets
+        dataset_pattern = "*bandpower*" + str(band_range[0]) + "-" + str(band_range[1]) + "Hz_PreMARBLE_dataset.npz"
+        dataset_files = find_preprocessed_datasets(save_dir, pattern=dataset_pattern)
+    else:
+        # Look for regular datasets (excluding bandpower ones)
+        dataset_files = find_preprocessed_datasets(save_dir, pattern="*PreMARBLE_dataset.npz")
+        # Filter out bandpower datasets
+        dataset_files = [f for f in dataset_files if "bandpower" not in f]
+    
     if dataset_files:
         # Load the most recent dataset
         batch_data, batch_times = load_preprocessed_data(dataset_files[-1])
@@ -45,7 +59,10 @@ if load_dataset:
         used_files = []  # No file tracking needed when loading preprocessed
         next_file_idx = 0
     else:
-        print("No preprocessed datasets found, loading from raw files...")
+        if use_bandpower:
+            print(f"No bandpower preprocessed datasets found for band {band_range[0]}-{band_range[1]}Hz, loading from raw files...")
+        else:
+            print("No preprocessed datasets found, loading from raw files...")
         load_dataset = False
 
 if not load_dataset:
@@ -86,28 +103,34 @@ if not load_dataset:
 
 # Plot samples from first batch to check data quality
 plt.figure(figsize=(12, 6))
+
+# Update method_suffix based on actual data type
+method_suffix = "bandpower" if use_bandpower else "raw"
+
 if use_bandpower:
     plt.subplot(2, 1, 1)
-    # For band power data, plot first 100 windows for the first 3 channels
-    plt.plot(batch_data[0, :100, :3])  
-    plt.title(f'Band Power Data ({band_range[0]}-{band_range[1]} Hz, first 100 windows, first 3 channels)')
+    # For band power data, plot first 100 windows (or all if less than 100) for the first 3 channels
+    plt_points = min(100, batch_data.shape[1])
+    plt.plot(batch_data[0, :plt_points, :3])  
+    plt.title(f'Band Power Data ({band_range[0]}-{band_range[1]} Hz, first {plt_points} windows, first 3 channels)')
     plt.grid(True)
     
     plt.subplot(2, 1, 2)
     # For band power data, plot corresponding time points
-    plt.plot(batch_times[0, :100])
-    plt.title('Time Array (first 100 windows)')
+    plt.plot(batch_times[0, :plt_points, 0] if batch_times.ndim > 2 else batch_times[0, :plt_points])
+    plt.title(f'Time Array (first {plt_points} windows)')
     plt.xlabel('Window')
     plt.ylabel('Time (seconds from reference)')
 else:
     plt.subplot(2, 1, 1)
-    plt.plot(batch_data[0, :1000, :3])  # First batch, first 1000 samples, first 3 channels
-    plt.title('EEG Data (first 1000 samples, first 3 channels)')
+    plt_points = min(1000, batch_data.shape[1])
+    plt.plot(batch_data[0, :plt_points, :3])  # First batch, first 1000 samples, first 3 channels
+    plt.title(f'EEG Data (first {plt_points} samples, first 3 channels)')
     plt.grid(True)
     
     plt.subplot(2, 1, 2)
-    plt.plot(batch_times[0, :1000])  # First batch, first 1000 time points
-    plt.title('Time Array (first 1000 samples)')
+    plt.plot(batch_times[0, :plt_points, 0] if batch_times.ndim > 2 else batch_times[0, :plt_points])
+    plt.title(f'Time Array (first {plt_points} samples)')
     plt.xlabel('Sample')
     plt.ylabel('Time (seconds from reference)')
 
@@ -118,9 +141,6 @@ plt.savefig('temp_Figures/raw_data_preview.png', dpi=300, bbox_inches='tight')
 # Prepare data for MARBLE
 pos_list, x_list, labels = prepare_MARBLE_data(batch_data, batch_times)
 
-# Define flags for loading saved data/model
-load_dataset = False 
-load_model = False
 
 # Define save paths based on method
 method_suffix = "bandpower" if use_bandpower else "raw"
@@ -144,7 +164,7 @@ params = {
 }
 
 # Construct or load dataset
-k_value = 500
+k_value = 50
 if not load_dataset:
     try:
         Dataset = MARBLE.construct_dataset(

@@ -672,7 +672,7 @@ def load_preprocessed_data(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
         raise FileNotFoundError(f"Preprocessed data file not found: {filepath}")
     
     # Load the compressed file
-    data_dict = np.load(filepath)
+    data_dict = np.load(filepath, allow_pickle=True)
     
     # Extract data and labels
     data = data_dict['data']
@@ -681,6 +681,19 @@ def load_preprocessed_data(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
     print(f"Loaded preprocessed data with shape: {data.shape}")
     if len(labels.shape) > 0:
         print(f"Loaded labels with shape: {labels.shape}")
+    
+    # Check if this is a bandpower dataset by looking for bandpower metadata
+    is_bandpower = False
+    metadata = {}
+    for key in ['band_range', 'window_size_ms', 'overlap']:
+        if key in data_dict:
+            is_bandpower = True
+            metadata[key] = data_dict[key]
+    
+    if is_bandpower:
+        print("Detected bandpower dataset with parameters:")
+        for key, value in metadata.items():
+            print(f"  {key}: {value}")
     
     return data, labels
 

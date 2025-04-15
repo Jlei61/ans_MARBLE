@@ -60,8 +60,9 @@ class net(nn.Module):
         """
         super().__init__()
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu")
+        
         if loadpath is not None:
             if Path(loadpath).is_dir():
                 loadpath = max(glob.glob(f"{loadpath}/best_model*"))

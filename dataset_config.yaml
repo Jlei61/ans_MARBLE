@@ -1,0 +1,56 @@
+# Dataset Construction Configuration
+
+# Data source and processing parameters
+data_dir: '/home/honglab/leijiaxin/MARBLE/preprocessed/bipolar'
+chunk_size_sec: 200                # Process data in chunks of this duration (seconds)
+
+save_dir: '/home/honglab/leijiaxin/MARBLE/datasets'
+
+# Dataset types to create
+create_raw_dataset: true
+create_bandpower_dataset: true
+create_event_segment_dataset: true
+
+# Optional: specify a reference time (will be set to 7AM of first day if not specified)
+# reference_time: '2023-01-01 07:00:00'
+
+# Raw dataset specific parameters
+raw_dataset:
+  resample_freq: 50  # Set to null or remove for no resampling
+  night_start_hour: 20  # 8PM
+  night_end_hour: 6     # 6AM
+
+# Event detection parameters for standard events
+event_detection:
+  low_band: [80, 250]    # Frequency band for standard events (Hz)
+  high_band: [250, 451]  # Frequency band for high-frequency events (Hz)
+  rel_thresh: 3.0        # Relative threshold factor
+  abs_thresh: 3.0        # Absolute threshold factor
+  min_gap: 20            # Minimum gap between events (samples)
+  min_last: 20           # Minimum distance to end of file (samples)
+
+# Event segment parameters
+event_segments:
+  pre_event_ms: 20        # Time before event to include (ms)
+  post_event_ms: 20       # Time after event to include (ms)
+  min_duration_ms: 20      # Minimum event duration to include (ms)
+  max_segments_per_file: None  # Maximum segments to extract per file
+  night_start_hour: 20     # 8PM - Start of night time
+  night_end_hour: 6        # 6AM - End of night time
+
+# Bandpower extraction parameters
+bandpower:
+  window_size_ms: 100    # Window size in milliseconds
+  overlap: 0.5           # Overlap between consecutive windows (0.0-1.0)
+  bands:                 # Frequency bands to extract (Hz)
+    gamma: [80, 250]
+    high_gamma: [250, 400]
+
+# Event segment dataset parameters
+event_segment:
+  pre_event: 0.5         # Time before event peak (seconds)
+  post_event: 0.5        # Time after event peak (seconds)
+  freq_bands:
+    - [80, 250]          # Low-frequency band (gamma)
+    - [250, 451]         # High-frequency band (high gamma)
+  # max_event_segments: 20000  # Optional: Maximum number of event segments to extract 
