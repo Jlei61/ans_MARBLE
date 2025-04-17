@@ -4,6 +4,7 @@ outputs/
 results/
 temp_Figures/
 temp_Data/
+datasets/
 
 *.pt
 *.png
