@@ -3,6 +3,7 @@
 # Data source and processing parameters
 data_dir: '/home/honglab/leijiaxin/MARBLE/preprocessed/bipolar'
 chunk_size_sec: 200                # Process data in chunks of this duration (seconds)
+# max_files: 3                      # Only process the first 3 files for testing
 
 save_dir: '/home/honglab/leijiaxin/MARBLE/datasets'
 
@@ -23,20 +24,17 @@ raw_dataset:
 # Event detection parameters for standard events
 event_detection:
   low_band: [80, 250]    # Frequency band for standard events (Hz)
-  high_band: [250, 451]  # Frequency band for high-frequency events (Hz)
+  high_band: [250, 400]  # Frequency band for high-frequency events (Hz)
   rel_thresh: 3.0        # Relative threshold factor
   abs_thresh: 3.0        # Absolute threshold factor
   min_gap: 20            # Minimum gap between events (samples)
-  min_last: 20           # Minimum distance to end of file (samples)
+  min_last: 30           # Minimum duration of events in ms
 
 # Event segment parameters
 event_segments:
-  pre_event_ms: 20        # Time before event to include (ms)
-  post_event_ms: 20       # Time after event to include (ms)
-  min_duration_ms: 20      # Minimum event duration to include (ms)
-  max_segments_per_file: None  # Maximum segments to extract per file
-  night_start_hour: 20     # 8PM - Start of night time
-  night_end_hour: 6        # 6AM - End of night time
+  fixed_segment_length_ms: 100 # All segments will have exactly this length
+  night_start_hour: 20        # 8PM - Start of night time
+  night_end_hour: 6           # 6AM - End of night time
 
 # Bandpower extraction parameters
 bandpower:
@@ -45,12 +43,3 @@ bandpower:
   bands:                 # Frequency bands to extract (Hz)
     gamma: [80, 250]
     high_gamma: [250, 400]
-
-# Event segment dataset parameters
-event_segment:
-  pre_event: 0.5         # Time before event peak (seconds)
-  post_event: 0.5        # Time after event peak (seconds)
-  freq_bands:
-    - [80, 250]          # Low-frequency band (gamma)
-    - [250, 451]         # High-frequency band (high gamma)
-  # max_event_segments: 20000  # Optional: Maximum number of event segments to extract 

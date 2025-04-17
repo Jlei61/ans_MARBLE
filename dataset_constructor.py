@@ -8,6 +8,7 @@ import pickle
 from glob import glob
 from typing import List, Tuple, Dict, Optional, Union
 import logging
+import re
 
 # Set up logging
 logging.basicConfig(
@@ -42,10 +43,111 @@ class Dataset:
     @classmethod
     def load(cls, filepath: str):
         """Load dataset from disk"""
-        raise NotImplementedError("Subclasses must implement this method")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Dataset file not found: {filepath}")
+        
+        try:
+            # Load the npz file
+            data_dict = np.load(filepath, allow_pickle=True)
+            
+            # Extract metadata
+            metadata = pickle.loads(data_dict['metadata'])
+            
+            # Create dataset instance
+            dataset = cls(metadata['config'])
+            
+            # Check if this is the alternative format (with individual chunks)
+            if 'n_chunks' in data_dict:
+                # Load using alternative format
+                n_chunks = int(data_dict['n_chunks'])
+                logger.info(f"Loading dataset using alternative format with {n_chunks} chunks")
+                
+                dataset.data = []
+                dataset.time_arrays = []
+                dataset.event_labels = []
+                dataset.day_night_labels = []
+                
+                for i in range(n_chunks):
+                    dataset.data.append(data_dict[f'data_{i}'])
+                    dataset.time_arrays.append(data_dict[f'time_{i}'])
+                    dataset.event_labels.append(data_dict[f'events_{i}'])
+                    dataset.day_night_labels.append(data_dict[f'day_night_{i}'])
+            else:
+                # Load using original format
+                data_array = data_dict['data']
+                time_array = data_dict['time']
+                event_array = data_dict['events']
+                
+                # Handle backward compatibility for day_night labels
+                if 'day_night' in data_dict:
+                    day_night_array = data_dict['day_night']
+                else:
+                    logger.warning("No day/night labels found in dataset, using default (all day)")
+                    day_night_array = np.ones_like(time_array)  # Default to all day
+                
+                # Handle potentially empty arrays
+                n_chunks = len(data_array) if hasattr(data_array, '__len__') else 0
+                
+                if n_chunks > 0:
+                    # Convert numpy arrays back to lists
+                    try:
+                        dataset.data = [data_array[i] for i in range(n_chunks)]
+                        dataset.time_arrays = [time_array[i] for i in range(n_chunks)]
+                        dataset.event_labels = [event_array[i] for i in range(n_chunks)]
+                        dataset.day_night_labels = [day_night_array[i] for i in range(n_chunks)]
+                    except Exception as e:
+                        logger.error(f"Error converting arrays to lists: {e}")
+                        # Try alternative access in case these are already lists
+                        dataset.data = list(data_array)
+                        dataset.time_arrays = list(time_array)
+                        dataset.event_labels = list(event_array)
+                        dataset.day_night_labels = list(day_night_array)
+                else:
+                    logger.warning("Dataset contains no chunks")
+                    dataset.data = []
+                    dataset.time_arrays = []
+                    dataset.event_labels = []
+                    dataset.day_night_labels = []
+            
+            dataset.metadata = metadata
+            
+            # Log shapes for debugging
+            if dataset.data:
+                logger.info(f"Loaded raw dataset shapes:")
+                for i, d in enumerate(dataset.data):
+                    logger.info(f"  Chunk {i}: shape {d.shape}")
+            
+            logger.info(f"Loaded raw dataset from {filepath} with {len(dataset)} chunks")
+            return dataset
+            
+        except Exception as e:
+            logger.error(f"Error loading dataset from {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def __len__(self):
-        """Return number of samples"""
+        """Return number of chunks"""
+        return len(self.time_arrays)
+        
+    def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
+                        batch_size: int = None, transpose: bool = False,
+                        chunks_per_batch_item: int = 1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Get concatenated data from the dataset with optional batching.
+        
+        Args:
+            start_idx: Index of first chunk to include
+            num_chunks: Number of chunks to include (None for all available from start_idx)
+            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            transpose: Whether to transpose the default output format
+            chunks_per_batch_item: Number of chunks to combine into each batch item
+            
+        Returns:
+            Tuple of (data, time_arrays, event_labels) with consistent shape:
+            - If batch_size is None: (time_steps, channels) or (channels, time_steps) if transpose=True
+            - If batch_size is specified: (batch_size, time_steps, channels) or (batch_size, channels, time_steps)
+        """
         raise NotImplementedError("Subclasses must implement this method")
 
 class RawDataset(Dataset):
@@ -91,12 +193,21 @@ class RawDataset(Dataset):
         self.day_night_labels.append(day_night_labels)
         self.file_indices.append(file_indices)
         
+        # Count distinct events
+        event_counts = count_distinct_events(event_labels)
+        total_events = sum(event_counts.values())
+        
         # Update metadata
         self.metadata["used_files"].extend(filenames)
         self.metadata["batch_info"].append({
             "shape": data.shape,
             "time_range": [float(time_array[0]), float(time_array[-1])],
-            "event_count": int(np.sum(event_labels)),
+            "event_count": total_events,
+            "event_type_counts": {
+                "type1": event_counts[1],
+                "type2": event_counts[2],
+                "type3": event_counts[3]
+            },
             "night_time_percentage": float(np.mean(day_night_labels == 0) * 100)
         })
         
@@ -104,61 +215,334 @@ class RawDataset(Dataset):
         """Save dataset to disk"""
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         
-        # Combine data for saving
-        data_array = np.array(self.data)
-        time_array = np.array(self.time_arrays)
-        event_array = np.array(self.event_labels)
-        day_night_array = np.array(self.day_night_labels)
+        # Check if we have any data to save
+        if not self.data:
+            logger.warning("No data to save in RawDataset")
+            # Save empty arrays
+            np.savez(
+                filepath,
+                data=np.array([], dtype=object),
+                time=np.array([], dtype=object),
+                events=np.array([], dtype=object),
+                day_night=np.array([], dtype=object),
+                metadata=pickle.dumps(self.metadata)
+            )
+            logger.info(f"Saved empty raw dataset to {filepath}")
+            return
         
-        # Save as npz
-        np.savez(
-            filepath,
-            data=data_array,
-            time=time_array,
-            events=event_array,
-            day_night=day_night_array,
-            metadata=pickle.dumps(self.metadata)
-        )
-        
-        logger.info(f"Saved raw dataset to {filepath}")
-        
+        try:
+            # First debug the shapes of our data
+            logger.info(f"Saving {len(self.data)} data chunks with shapes:")
+            for i, d in enumerate(self.data):
+                logger.info(f"  Chunk {i}: shape {d.shape}")
+            
+            # Create a pickled list of data arrays instead of trying to stack them
+            # This avoids broadcasting errors with inconsistent shapes
+            data_list = self.data  # Keep as Python list
+            time_arrays_list = self.time_arrays
+            event_labels_list = self.event_labels
+            day_night_labels_list = self.day_night_labels
+            
+            # Save as npz with pickle for lists
+            np.savez(
+                filepath,
+                data=np.array(data_list, dtype=object),  # This should work with dtype=object
+                time=np.array(time_arrays_list, dtype=object),
+                events=np.array(event_labels_list, dtype=object),
+                day_night=np.array(day_night_labels_list, dtype=object),
+                metadata=pickle.dumps(self.metadata)
+            )
+            
+            logger.info(f"Saved raw dataset to {filepath}")
+        except Exception as e:
+            logger.error(f"Error saving raw dataset: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try alternative saving method
+            try:
+                logger.info("Trying alternative saving method...")
+                # Create a dictionary with individual chunks to avoid array creation
+                save_dict = {
+                    'metadata': pickle.dumps(self.metadata)
+                }
+                
+                # Save each chunk separately
+                for i, (data, time, events, day_night) in enumerate(zip(
+                    self.data, self.time_arrays, self.event_labels, self.day_night_labels)):
+                    save_dict[f'data_{i}'] = data
+                    save_dict[f'time_{i}'] = time
+                    save_dict[f'events_{i}'] = events
+                    save_dict[f'day_night_{i}'] = day_night
+                
+                # Add chunk count
+                save_dict['n_chunks'] = len(self.data)
+                
+                # Save as npz
+                np.savez(filepath, **save_dict)
+                logger.info(f"Saved raw dataset using alternative method to {filepath}")
+            except Exception as e2:
+                logger.error(f"Error using alternative save method: {e2}")
+                traceback.print_exc()
+                raise
+    
     @classmethod
     def load(cls, filepath: str):
         """Load dataset from disk"""
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Dataset file not found: {filepath}")
         
-        # Load the npz file
-        data_dict = np.load(filepath, allow_pickle=True)
-        
-        # Extract data
-        data_array = data_dict['data']
-        time_array = data_dict['time']
-        event_array = data_dict['events']
-        
-        # Handle backward compatibility for day_night labels
-        if 'day_night' in data_dict:
-            day_night_array = data_dict['day_night']
-        else:
-            logger.warning("No day/night labels found in dataset, using default (all day)")
-            day_night_array = np.ones_like(time_array)  # Default to all day
-        
-        metadata = pickle.loads(data_dict['metadata'])
-        
-        # Create dataset instance
-        dataset = cls(metadata['config'])
-        dataset.data = [data_array[i] for i in range(len(data_array))]
-        dataset.time_arrays = [time_array[i] for i in range(len(time_array))]
-        dataset.event_labels = [event_array[i] for i in range(len(event_array))]
-        dataset.day_night_labels = [day_night_array[i] for i in range(len(day_night_array))]
-        dataset.metadata = metadata
-        
-        logger.info(f"Loaded raw dataset from {filepath} with {len(dataset)} chunks")
-        return dataset
+        try:
+            # Load the npz file
+            data_dict = np.load(filepath, allow_pickle=True)
+            
+            # Extract metadata
+            metadata = pickle.loads(data_dict['metadata'])
+            
+            # Create dataset instance
+            dataset = cls(metadata['config'])
+            
+            # Check if this is the alternative format (with individual chunks)
+            if 'n_chunks' in data_dict:
+                # Load using alternative format
+                n_chunks = int(data_dict['n_chunks'])
+                logger.info(f"Loading dataset using alternative format with {n_chunks} chunks")
+                
+                dataset.data = []
+                dataset.time_arrays = []
+                dataset.event_labels = []
+                dataset.day_night_labels = []
+                
+                for i in range(n_chunks):
+                    dataset.data.append(data_dict[f'data_{i}'])
+                    dataset.time_arrays.append(data_dict[f'time_{i}'])
+                    dataset.event_labels.append(data_dict[f'events_{i}'])
+                    dataset.day_night_labels.append(data_dict[f'day_night_{i}'])
+            else:
+                # Load using original format
+                data_array = data_dict['data']
+                time_array = data_dict['time']
+                event_array = data_dict['events']
+                
+                # Handle backward compatibility for day_night labels
+                if 'day_night' in data_dict:
+                    day_night_array = data_dict['day_night']
+                else:
+                    logger.warning("No day/night labels found in dataset, using default (all day)")
+                    day_night_array = np.ones_like(time_array)  # Default to all day
+                
+                # Handle potentially empty arrays
+                n_chunks = len(data_array) if hasattr(data_array, '__len__') else 0
+                
+                if n_chunks > 0:
+                    # Convert numpy arrays back to lists
+                    try:
+                        dataset.data = [data_array[i] for i in range(n_chunks)]
+                        dataset.time_arrays = [time_array[i] for i in range(n_chunks)]
+                        dataset.event_labels = [event_array[i] for i in range(n_chunks)]
+                        dataset.day_night_labels = [day_night_array[i] for i in range(n_chunks)]
+                    except Exception as e:
+                        logger.error(f"Error converting arrays to lists: {e}")
+                        # Try alternative access in case these are already lists
+                        dataset.data = list(data_array)
+                        dataset.time_arrays = list(time_array)
+                        dataset.event_labels = list(event_array)
+                        dataset.day_night_labels = list(day_night_array)
+                else:
+                    logger.warning("Dataset contains no chunks")
+                    dataset.data = []
+                    dataset.time_arrays = []
+                    dataset.event_labels = []
+                    dataset.day_night_labels = []
+            
+            dataset.metadata = metadata
+            
+            # Log shapes for debugging
+            if dataset.data:
+                logger.info(f"Loaded raw dataset shapes:")
+                for i, d in enumerate(dataset.data):
+                    logger.info(f"  Chunk {i}: shape {d.shape}")
+            
+            logger.info(f"Loaded raw dataset from {filepath} with {len(dataset)} chunks")
+            return dataset
+            
+        except Exception as e:
+            logger.error(f"Error loading dataset from {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def __len__(self):
         """Return number of chunks"""
         return len(self.data)
+    
+    def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
+                        batch_size: int = None, transpose: bool = False,
+                        chunks_per_batch_item: int = 1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Get concatenated data from raw dataset with optional batching.
+        
+        Args:
+            start_idx: Index of first chunk to include
+            num_chunks: Number of chunks to include (None for all available from start_idx)
+            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            transpose: Whether to transpose from (Channel x Time) to (Time x Channel)
+            chunks_per_batch_item: Number of chunks to combine into each batch item
+            
+        Returns:
+            Tuple of (data, time_arrays, event_labels) with consistent shape:
+            - If batch_size is None and transpose=True: (time_steps, channels)
+            - If batch_size is None and transpose=False: (channels, time_steps)
+            - If batch_size is specified and transpose=True: (batch_size, time_steps, channels)
+            - If batch_size is specified and transpose=False: (batch_size, channels, time_steps)
+        """
+        if not self.data:
+            logger.warning("No data available in RawDataset")
+            return np.array([]), np.array([]), np.array([])
+        
+        # Determine how many chunks to process
+        end_idx = len(self.data) if num_chunks is None else min(start_idx + num_chunks, len(self.data))
+        chunks_to_process = list(range(start_idx, end_idx))
+        
+        if not chunks_to_process:
+            logger.warning(f"No valid chunks in range start_idx={start_idx}, num_chunks={num_chunks}")
+            return np.array([]), np.array([]), np.array([])
+        
+        # Process data based on batching requirements
+        if batch_size is None:
+            # If chunks_per_batch_item is 1, handle as before
+            if chunks_per_batch_item == 1:
+                # Concatenate all requested chunks
+                data_chunks = [self.data[i] for i in chunks_to_process]
+                time_chunks = [self.time_arrays[i] for i in chunks_to_process]
+                event_chunks = [self.event_labels[i] for i in chunks_to_process]
+                
+                # Concatenate along time dimension (axis=1 for channel x time)
+                concatenated_data = np.concatenate(data_chunks, axis=1)
+                concatenated_time = np.concatenate(time_chunks)
+                concatenated_events = np.concatenate(event_chunks)
+                
+                # Transpose if requested (to Time x Channel)
+                if transpose:
+                    concatenated_data = concatenated_data.T
+                
+                return concatenated_data, concatenated_time, concatenated_events
+            else:
+                # Group chunks into batch items based on chunks_per_batch_item
+                total_batch_items = len(chunks_to_process) // chunks_per_batch_item
+                if total_batch_items == 0:
+                    logger.warning(f"Not enough chunks for a single batch item (have {len(chunks_to_process)}, need {chunks_per_batch_item})")
+                    return np.array([]), np.array([]), np.array([])
+                
+                batch_items_data = []
+                batch_items_time = []
+                batch_items_events = []
+                
+                # Process each group of chunks
+                for i in range(total_batch_items):
+                    chunk_group = chunks_to_process[i * chunks_per_batch_item:(i + 1) * chunks_per_batch_item]
+                    
+                    # Combine chunks in this group
+                    group_data_chunks = [self.data[j] for j in chunk_group]
+                    group_time_chunks = [self.time_arrays[j] for j in chunk_group]
+                    group_event_chunks = [self.event_labels[j] for j in chunk_group]
+                    
+                    # Concatenate this group along time dimension (axis=1 for Channel x Time)
+                    group_data = np.concatenate(group_data_chunks, axis=1)
+                    group_time = np.concatenate(group_time_chunks)
+                    group_events = np.concatenate(group_event_chunks)
+                    
+                    # Transpose if needed
+                    if transpose:
+                        group_data = group_data.T
+                    
+                    batch_items_data.append(group_data)
+                    batch_items_time.append(group_time)
+                    batch_items_events.append(group_events)
+                
+                # Since batch_size is None, concatenate all batch items
+                # We need to handle the axis differently depending on transpose
+                if transpose:
+                    # For transpose=True, data is already (Time x Channel) in each item
+                    # So concatenate on axis=0 (stacking time dimensions)
+                    all_data = np.concatenate(batch_items_data, axis=0)
+                else:
+                    # For transpose=False, data is (Channel x Time) in each item
+                    # So concatenate on axis=1 (stacking time dimensions)
+                    all_data = np.concatenate(batch_items_data, axis=1)
+                
+                all_time = np.concatenate(batch_items_time)
+                all_events = np.concatenate(batch_items_events)
+                
+                return all_data, all_time, all_events
+        else:
+            # Calculate number of batch items needed
+            total_batch_items = len(chunks_to_process) // chunks_per_batch_item
+            
+            # Calculate number of batches based on batch items
+            num_batches = total_batch_items // batch_size
+            
+            if num_batches == 0:
+                logger.warning(f"Not enough chunks for a single batch (have {total_batch_items} batch items, need {batch_size})")
+                return np.array([]), np.array([]), np.array([])
+            
+            # Initialize batch arrays
+            batch_data = []
+            batch_times = []
+            batch_events = []
+            
+            # Process each batch
+            for b in range(num_batches):
+                batch_items = list(range(b * batch_size, (b + 1) * batch_size))
+                
+                # Process each batch item
+                batch_item_data = []
+                batch_item_times = []
+                batch_item_events = []
+                
+                for item_idx in batch_items:
+                    # Get chunks for this batch item
+                    start_chunk = start_idx + (item_idx * chunks_per_batch_item)
+                    end_chunk = start_chunk + chunks_per_batch_item
+                    item_chunks = list(range(start_chunk, min(end_chunk, len(self.data))))
+                    
+                    # Skip if no valid chunks
+                    if not item_chunks:
+                        continue
+                    
+                    # Concatenate chunks for this batch item
+                    item_data_chunks = [self.data[j] for j in item_chunks]
+                    item_time_chunks = [self.time_arrays[j] for j in item_chunks]
+                    item_event_chunks = [self.event_labels[j] for j in item_chunks]
+                    
+                    item_data = np.concatenate(item_data_chunks, axis=1)
+                    item_time = np.concatenate(item_time_chunks)
+                    item_events = np.concatenate(item_event_chunks)
+                    
+                    # Transpose if needed
+                    if transpose:
+                        item_data = item_data.T
+                        
+                    batch_item_data.append(item_data)
+                    batch_item_times.append(item_time)
+                    batch_item_events.append(item_events)
+                
+                if batch_item_data:
+                    # Stack all items in this batch
+                    batch_data.append(np.stack(batch_item_data))
+                    batch_times.append(np.stack(batch_item_times))
+                    batch_events.append(np.stack(batch_item_events))
+            
+            if not batch_data:
+                logger.warning("No valid batches created")
+                return np.array([]), np.array([]), np.array([])
+                
+            # Stack all batches
+            batched_data = np.stack(batch_data)
+            batched_times = np.stack(batch_times)
+            batched_events = np.stack(batch_events)
+            
+            return batched_data, batched_times, batched_events
 
 class BandpowerDataset(Dataset):
     """Dataset containing bandpower features for multiple frequency bands"""
@@ -224,12 +608,21 @@ class BandpowerDataset(Dataset):
         self.day_night_labels.append(day_night_labels)
         self.file_indices.append(file_indices)
         
+        # Count distinct events
+        event_counts = count_distinct_events(event_labels)
+        total_events = sum(event_counts.values())
+        
         # Update metadata
         self.metadata["used_files"].extend(filenames)
         self.metadata["batch_info"].append({
             "shape": {band: data.shape for band, data in band_data.items()},
             "time_range": [float(time_array[0]), float(time_array[-1])],
-            "event_count": int(np.sum(event_labels)),
+            "event_count": total_events,
+            "event_type_counts": {
+                "type1": event_counts[1],
+                "type2": event_counts[2],
+                "type3": event_counts[3]
+            },
             "night_time_percentage": float(np.mean(day_night_labels == 0) * 100)
         })
         
@@ -240,14 +633,14 @@ class BandpowerDataset(Dataset):
         # Prepare data for saving
         save_dict = {
             'metadata': pickle.dumps(self.metadata),
-            'time': np.array(self.time_arrays),
-            'events': np.array(self.event_labels),
-            'day_night': np.array(self.day_night_labels)
+            'time': np.array(self.time_arrays, dtype=object),
+            'events': np.array(self.event_labels, dtype=object),
+            'day_night': np.array(self.day_night_labels, dtype=object)
         }
         
         # Add bandpower data for each band
         for band_name, band_data in self.bands.items():
-            save_dict[f'band_{band_name}'] = np.array(band_data)
+            save_dict[f'band_{band_name}'] = np.array(band_data, dtype=object)
         
         # Save as npz
         np.savez(filepath, **save_dict)
@@ -260,46 +653,239 @@ class BandpowerDataset(Dataset):
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Dataset file not found: {filepath}")
         
-        # Load the npz file
-        data_dict = np.load(filepath, allow_pickle=True)
-        
-        # Extract metadata
-        metadata = pickle.loads(data_dict['metadata'])
-        
-        # Create dataset instance
-        dataset = cls(metadata['config'])
-        
-        # Load time and event data
-        time_array = data_dict['time']
-        event_array = data_dict['events']
-        
-        dataset.time_arrays = [time_array[i] for i in range(len(time_array))]
-        dataset.event_labels = [event_array[i] for i in range(len(event_array))]
-        
-        # Handle backward compatibility for day_night labels
-        if 'day_night' in data_dict:
-            day_night_array = data_dict['day_night']
-            dataset.day_night_labels = [day_night_array[i] for i in range(len(day_night_array))]
-        else:
-            logger.warning("No day/night labels found in dataset, using default (all day)")
-            dataset.day_night_labels = [np.ones_like(t) for t in time_array]
-        
-        # Load band data
-        dataset.bands = {}
-        for key in data_dict.keys():
-            if key.startswith('band_'):
-                band_name = key[5:]  # Remove 'band_' prefix
-                band_data = data_dict[key]
-                dataset.bands[band_name] = [band_data[i] for i in range(len(band_data))]
-        
-        dataset.metadata = metadata
-        
-        logger.info(f"Loaded bandpower dataset from {filepath} with {len(dataset)} chunks and bands: {list(dataset.bands.keys())}")
-        return dataset
+        try:
+            # Load the npz file
+            data_dict = np.load(filepath, allow_pickle=True)
+            
+            # Extract metadata
+            metadata = pickle.loads(data_dict['metadata'])
+            
+            # Create dataset instance
+            dataset = cls(metadata['config'])
+            
+            # Load time and event data
+            time_array = data_dict['time']
+            event_array = data_dict['events']
+            
+            # Handle potentially empty arrays
+            n_chunks = len(time_array) if hasattr(time_array, '__len__') else 0
+            
+            if n_chunks > 0:
+                dataset.time_arrays = [time_array[i] for i in range(n_chunks)]
+                dataset.event_labels = [event_array[i] for i in range(n_chunks)]
+                
+                # Handle backward compatibility for day_night labels
+                if 'day_night' in data_dict:
+                    day_night_array = data_dict['day_night']
+                    dataset.day_night_labels = [day_night_array[i] for i in range(n_chunks)]
+                else:
+                    logger.warning("No day/night labels found in dataset, using default (all day)")
+                    dataset.day_night_labels = [np.ones_like(t) for t in dataset.time_arrays]
+                
+                # Load band data
+                dataset.bands = {}
+                for key in data_dict.keys():
+                    if key.startswith('band_'):
+                        band_name = key[5:]  # Remove 'band_' prefix
+                        band_data = data_dict[key]
+                        dataset.bands[band_name] = [band_data[i] for i in range(n_chunks)]
+            else:
+                logger.warning("Dataset contains no chunks")
+                dataset.time_arrays = []
+                dataset.event_labels = []
+                dataset.day_night_labels = []
+                dataset.bands = {}
+            
+            dataset.metadata = metadata
+            
+            logger.info(f"Loaded bandpower dataset from {filepath} with {len(dataset)} chunks and bands: {list(dataset.bands.keys())}")
+            return dataset
+            
+        except Exception as e:
+            logger.error(f"Error loading dataset from {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def __len__(self):
         """Return number of chunks"""
         return len(self.time_arrays)
+    
+    def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
+                        batch_size: int = None, transpose: bool = False, 
+                        band_name: str = None, chunks_per_batch_item: int = 1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Get concatenated bandpower data with optional batching.
+        
+        Args:
+            start_idx: Index of first chunk to include
+            num_chunks: Number of chunks to include (None for all available from start_idx)
+            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            transpose: Whether to transpose from (Windows x Channel) to (Channel x Windows)
+                      Default is False, which returns (Windows x Channel)
+            band_name: Which frequency band to use (if None, uses first available)
+            chunks_per_batch_item: Number of chunks to combine into each batch item
+            
+        Returns:
+            Tuple of (data, time_arrays, event_labels) with consistent shape:
+            - If batch_size is None and transpose=False: (windows, channels)
+            - If batch_size is None and transpose=True: (channels, windows)
+            - If batch_size is specified and transpose=False: (batch_size, windows, channels)
+            - If batch_size is specified and transpose=True: (batch_size, channels, windows)
+        """
+        if not self.bands:
+            logger.warning("No band data available in BandpowerDataset")
+            return np.array([]), np.array([]), np.array([])
+        
+        # Use specified band or first available
+        if band_name is None or band_name not in self.bands:
+            band_name = list(self.bands.keys())[0]
+            logger.info(f"Using band '{band_name}' for data")
+        
+        # Determine how many chunks to process
+        end_idx = len(self.time_arrays) if num_chunks is None else min(start_idx + num_chunks, len(self.time_arrays))
+        chunks_to_process = list(range(start_idx, end_idx))
+        
+        if not chunks_to_process:
+            logger.warning(f"No valid chunks in range start_idx={start_idx}, num_chunks={num_chunks}")
+            return np.array([]), np.array([]), np.array([])
+        
+        # Process data based on batching requirements
+        if batch_size is None:
+            # If chunks_per_batch_item is 1, handle as before
+            if chunks_per_batch_item == 1:
+                # Concatenate all requested chunks
+                data_chunks = [self.bands[band_name][i] for i in chunks_to_process]
+                time_chunks = [self.time_arrays[i] for i in chunks_to_process]
+                event_chunks = [self.event_labels[i] for i in chunks_to_process]
+                
+                # Concatenate along time/window dimension (axis=0 for windows x channels)
+                concatenated_data = np.concatenate(data_chunks, axis=0)
+                concatenated_time = np.concatenate(time_chunks)
+                concatenated_events = np.concatenate(event_chunks)
+                
+                # Transpose if requested (to Channel x Windows)
+                if transpose:
+                    concatenated_data = concatenated_data.T
+                
+                return concatenated_data, concatenated_time, concatenated_events
+            else:
+                # Group chunks into batch items based on chunks_per_batch_item
+                total_batch_items = len(chunks_to_process) // chunks_per_batch_item
+                if total_batch_items == 0:
+                    logger.warning(f"Not enough chunks for a single batch item (have {len(chunks_to_process)}, need {chunks_per_batch_item})")
+                    return np.array([]), np.array([]), np.array([])
+                
+                batch_items_data = []
+                batch_items_time = []
+                batch_items_events = []
+                
+                # Process each group of chunks
+                for i in range(total_batch_items):
+                    chunk_group = chunks_to_process[i * chunks_per_batch_item:(i + 1) * chunks_per_batch_item]
+                    
+                    # Combine chunks in this group
+                    group_data_chunks = [self.bands[band_name][j] for j in chunk_group]
+                    group_time_chunks = [self.time_arrays[j] for j in chunk_group]
+                    group_event_chunks = [self.event_labels[j] for j in chunk_group]
+                    
+                    # Concatenate this group along window dimension (axis=0 for Windows x Channels)
+                    group_data = np.concatenate(group_data_chunks, axis=0)
+                    group_time = np.concatenate(group_time_chunks)
+                    group_events = np.concatenate(group_event_chunks)
+                    
+                    # Transpose if needed
+                    if transpose:
+                        group_data = group_data.T
+                    
+                    batch_items_data.append(group_data)
+                    batch_items_time.append(group_time)
+                    batch_items_events.append(group_events)
+                
+                # Since batch_size is None, concatenate all batch items
+                # We need to handle the axis differently depending on transpose
+                if transpose:
+                    # For transpose=True, data is already (Channel x Windows) in each item
+                    # So concatenate on axis=1 (stacking window dimensions)
+                    all_data = np.concatenate(batch_items_data, axis=1)
+                else:
+                    # For transpose=False, data is (Windows x Channel) in each item
+                    # So concatenate on axis=0 (stacking window dimensions)
+                    all_data = np.concatenate(batch_items_data, axis=0)
+                
+                all_time = np.concatenate(batch_items_time)
+                all_events = np.concatenate(batch_items_events)
+                
+                return all_data, all_time, all_events
+        else:
+            # Calculate number of batch items needed
+            total_batch_items = len(chunks_to_process) // chunks_per_batch_item
+            
+            # Calculate number of batches based on batch items
+            num_batches = total_batch_items // batch_size
+            
+            if num_batches == 0:
+                logger.warning(f"Not enough chunks for a single batch (have {total_batch_items} batch items, need {batch_size})")
+                return np.array([]), np.array([]), np.array([])
+            
+            # Initialize batch arrays
+            batch_data = []
+            batch_times = []
+            batch_events = []
+            
+            # Process each batch
+            for b in range(num_batches):
+                batch_items = list(range(b * batch_size, (b + 1) * batch_size))
+                
+                # Process each batch item
+                batch_item_data = []
+                batch_item_times = []
+                batch_item_events = []
+                
+                for item_idx in batch_items:
+                    # Get chunks for this batch item
+                    start_chunk = start_idx + (item_idx * chunks_per_batch_item)
+                    end_chunk = start_chunk + chunks_per_batch_item
+                    item_chunks = list(range(start_chunk, min(end_chunk, len(self.time_arrays))))
+                    
+                    # Skip if no valid chunks
+                    if not item_chunks:
+                        continue
+                    
+                    # Concatenate chunks for this batch item
+                    item_data_chunks = [self.bands[band_name][j] for j in item_chunks]
+                    item_time_chunks = [self.time_arrays[j] for j in item_chunks]
+                    item_event_chunks = [self.event_labels[j] for j in item_chunks]
+                    
+                    # Concatenate along window dimension (axis=0 for Windows x Channels)
+                    item_data = np.concatenate(item_data_chunks, axis=0)
+                    item_time = np.concatenate(item_time_chunks)
+                    item_events = np.concatenate(item_event_chunks)
+                    
+                    # Transpose if needed
+                    if transpose:
+                        item_data = item_data.T
+                        
+                    batch_item_data.append(item_data)
+                    batch_item_times.append(item_time)
+                    batch_item_events.append(item_events)
+                
+                if batch_item_data:
+                    # Stack all items in this batch
+                    batch_data.append(np.stack(batch_item_data))
+                    batch_times.append(np.stack(batch_item_times))
+                    batch_events.append(np.stack(batch_item_events))
+            
+            if not batch_data:
+                logger.warning("No valid batches created")
+                return np.array([]), np.array([]), np.array([])
+                
+            # Stack all batches
+            batched_data = np.stack(batch_data)
+            batched_times = np.stack(batch_times)
+            batched_events = np.stack(batch_events)
+            
+            return batched_data, batched_times, batched_events
     
     def get_data_for_marble(self, band_name: str = None, transpose: bool = True) -> List[np.ndarray]:
         """
@@ -483,81 +1069,191 @@ class EventSegmentDataset(Dataset):
         """Save dataset to disk"""
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         
-        # Combine data for saving
-        data_array = np.array(self.data)
-        abs_time_array = np.array(self.time_arrays)
-        rel_time_array = np.array(self.rel_time_arrays)
-        event_labels_array = np.array(self.event_labels)
-        day_night_array = np.array(self.day_night_labels)
-        sources_array = np.array(self.event_sources, dtype=object)
+        try:
+            # Check if all segments have the same shape
+            if self.data:
+                shapes = [segment.shape for segment in self.data]
+                first_shape = shapes[0]
+                
+                # If segments have different shapes, log a warning
+                if not all(shape == first_shape for shape in shapes):
+                    logger.warning(f"Segments have inconsistent shapes: {set(shapes)}")
+                    logger.info("Converting data to object arrays to handle inconsistent shapes")
+            
+            # Combine data for saving - use dtype=object to handle different shapes
+            data_array = np.array(self.data, dtype=object)
+            abs_time_array = np.array(self.time_arrays, dtype=object)
+            rel_time_array = np.array(self.rel_time_arrays, dtype=object)
+            event_labels_array = np.array(self.event_labels, dtype=object)
+            day_night_array = np.array(self.day_night_labels, dtype=object)
+            sources_array = np.array(self.event_sources, dtype=object)
+            
+            # Save as npz
+            np.savez(
+                filepath,
+                data=data_array,
+                abs_time=abs_time_array,
+                rel_time=rel_time_array,
+                events=event_labels_array,
+                day_night=day_night_array,
+                sources=sources_array,
+                metadata=pickle.dumps(self.metadata)
+            )
+            
+            logger.info(f"Saved event segment dataset to {filepath} with {len(self.data)} segments")
         
-        # Save as npz
-        np.savez(
-            filepath,
-            data=data_array,
-            abs_time=abs_time_array,
-            rel_time=rel_time_array,
-            events=event_labels_array,
-            day_night=day_night_array,
-            sources=sources_array,
-            metadata=pickle.dumps(self.metadata)
-        )
-        
-        logger.info(f"Saved event segment dataset to {filepath} with {len(self.data)} segments")
-        
+        except Exception as e:
+            logger.error(f"Error saving event segment dataset: {e}")
+            logger.error("Trying alternative save method...")
+            
+            try:
+                # Alternative save method: save each segment separately
+                save_dict = {
+                    'metadata': pickle.dumps(self.metadata),
+                    'n_segments': len(self.data)
+                }
+                
+                # Save each segment separately
+                for i in range(len(self.data)):
+                    save_dict[f'data_{i}'] = self.data[i]
+                    save_dict[f'abs_time_{i}'] = self.time_arrays[i]
+                    save_dict[f'rel_time_{i}'] = self.rel_time_arrays[i]
+                    save_dict[f'events_{i}'] = self.event_labels[i]
+                    save_dict[f'day_night_{i}'] = self.day_night_labels[i]
+                    save_dict[f'source_{i}'] = self.event_sources[i]
+                
+                # Save as npz
+                np.savez(filepath, **save_dict)
+                logger.info(f"Saved event segment dataset using alternative method to {filepath} with {len(self.data)} segments")
+            
+            except Exception as e2:
+                logger.error(f"Alternative save method also failed: {e2}")
+                import traceback
+                traceback.print_exc()
+                raise
+    
     @classmethod
     def load(cls, filepath: str):
         """Load dataset from disk"""
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Dataset file not found: {filepath}")
         
-        # Load the npz file
-        data_dict = np.load(filepath, allow_pickle=True)
-        
-        # Extract data
-        data_array = data_dict['data']
-        
-        # Handle absolute and relative time for backward compatibility
-        if 'abs_time' in data_dict:
-            abs_time_array = data_dict['abs_time']
-        else:
-            abs_time_array = data_dict['time']  # For backward compatibility
+        try:
+            # Load the npz file
+            data_dict = np.load(filepath, allow_pickle=True)
             
-        if 'rel_time' in data_dict:
-            rel_time_array = data_dict['rel_time']
-        else:
-            # Create relative time arrays if not available
-            rel_time_array = np.array([t - t[0] for t in abs_time_array])
-        
-        # Handle event labels for backward compatibility
-        if 'events' in data_dict:
-            event_labels_array = data_dict['events']
-        else:
-            # Default to all type 1 events
-            event_labels_array = np.array([np.ones_like(t) for t in abs_time_array])
-        
-        # Handle day/night labels for backward compatibility
-        if 'day_night' in data_dict:
-            day_night_array = data_dict['day_night']
-        else:
-            # Default to all day
-            day_night_array = np.array([np.ones_like(t) for t in abs_time_array])
-        
-        sources_array = data_dict['sources']
-        metadata = pickle.loads(data_dict['metadata'])
-        
-        # Create dataset instance
-        dataset = cls(metadata['config'])
-        dataset.data = [data_array[i] for i in range(len(data_array))]
-        dataset.time_arrays = [abs_time_array[i] for i in range(len(abs_time_array))]
-        dataset.rel_time_arrays = [rel_time_array[i] for i in range(len(rel_time_array))]
-        dataset.event_labels = [event_labels_array[i] for i in range(len(event_labels_array))]
-        dataset.day_night_labels = [day_night_array[i] for i in range(len(day_night_array))]
-        dataset.event_sources = [sources_array[i] for i in range(len(sources_array))]
-        dataset.metadata = metadata
-        
-        logger.info(f"Loaded event segment dataset from {filepath} with {len(dataset)} segments")
-        return dataset
+            # Extract metadata
+            metadata = pickle.loads(data_dict['metadata'])
+            
+            # Create dataset instance
+            dataset = cls(metadata['config'])
+            
+            # Check if this is the alternative format (with individual segments)
+            if 'n_segments' in data_dict:
+                # Load using alternative format
+                n_segments = int(data_dict['n_segments'])
+                logger.info(f"Loading dataset using alternative format with {n_segments} segments")
+                
+                dataset.data = []
+                dataset.time_arrays = []
+                dataset.rel_time_arrays = []
+                dataset.event_labels = []
+                dataset.day_night_labels = []
+                dataset.event_sources = []
+                
+                for i in range(n_segments):
+                    dataset.data.append(data_dict[f'data_{i}'])
+                    dataset.time_arrays.append(data_dict[f'abs_time_{i}'])
+                    dataset.rel_time_arrays.append(data_dict[f'rel_time_{i}'])
+                    dataset.event_labels.append(data_dict[f'events_{i}'])
+                    dataset.day_night_labels.append(data_dict[f'day_night_{i}'])
+                    if f'source_{i}' in data_dict:
+                        dataset.event_sources.append(data_dict[f'source_{i}'])
+                    else:
+                        # Handle missing source info
+                        dataset.event_sources.append({
+                            'file': 'unknown',
+                            'segment_idx': i,
+                            'shape': dataset.data[i].shape
+                        })
+            else:
+                # Extract segment data using original format
+                data_array = data_dict['data']
+                
+                # Use correct field names to match what's saved in save()
+                abs_time_array = data_dict['abs_time']
+                rel_time_array = data_dict['rel_time']
+                event_array = data_dict['events']
+                sources_array = data_dict['sources']
+                
+                # Handle potentially empty arrays
+                n_segments = len(data_array) if hasattr(data_array, '__len__') else 0
+                
+                if n_segments > 0:
+                    try:
+                        dataset.data = [data_array[i] for i in range(n_segments)]
+                        dataset.time_arrays = [abs_time_array[i] for i in range(n_segments)]
+                        dataset.rel_time_arrays = [rel_time_array[i] for i in range(n_segments)]
+                        dataset.event_labels = [event_array[i] for i in range(n_segments)]
+                        dataset.event_sources = [sources_array[i] for i in range(n_segments)]
+                    except Exception as e:
+                        logger.error(f"Error converting arrays to lists: {e}")
+                        # Try alternative access in case arrays have inconsistent shapes
+                        dataset.data = list(data_array)
+                        dataset.time_arrays = list(abs_time_array)
+                        dataset.rel_time_arrays = list(rel_time_array)
+                        dataset.event_labels = list(event_array)
+                        dataset.event_sources = list(sources_array)
+                    
+                    # Handle backward compatibility for day_night labels
+                    if 'day_night' in data_dict:
+                        day_night_array = data_dict['day_night']
+                        try:
+                            dataset.day_night_labels = [day_night_array[i] for i in range(n_segments)]
+                        except Exception as e:
+                            logger.error(f"Error converting day/night arrays: {e}")
+                            dataset.day_night_labels = list(day_night_array)
+                    else:
+                        logger.warning("No day/night labels found in dataset, using default (all day)")
+                        dataset.day_night_labels = [np.ones_like(t) for t in dataset.time_arrays]
+                    
+                    # Get segment info from metadata if available
+                    if 'segment_files' in metadata:
+                        dataset.segment_files = metadata['segment_files']
+                    if 'segment_indices' in metadata:
+                        dataset.segment_indices = metadata['segment_indices']
+                else:
+                    logger.warning("Dataset contains no segments")
+                    dataset.data = []
+                    dataset.time_arrays = []
+                    dataset.rel_time_arrays = []
+                    dataset.event_labels = []
+                    dataset.day_night_labels = []
+                    dataset.event_sources = []
+            
+            dataset.metadata = metadata
+            
+            # Verify data integrity
+            if dataset.data:
+                logger.info(f"Loaded event segment dataset shapes:")
+                shape_counts = {}
+                for i, d in enumerate(dataset.data):
+                    shape = d.shape
+                    if shape in shape_counts:
+                        shape_counts[shape] += 1
+                    else:
+                        shape_counts[shape] = 1
+                
+                logger.info(f"  Shape distribution: {shape_counts}")
+            
+            logger.info(f"Loaded event segment dataset from {filepath} with {len(dataset)} segments")
+            return dataset
+            
+        except Exception as e:
+            logger.error(f"Error loading dataset from {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def __len__(self):
         """Return number of segments"""
@@ -614,6 +1310,179 @@ class EventSegmentDataset(Dataset):
             current_idx += segment_length
             
         return concatenated_data, concatenated_time, concatenated_events, concatenated_day_night, boundaries
+    
+    def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
+                        batch_size: int = None, transpose: bool = False,
+                        chunks_per_batch_item: int = 1, use_relative_time: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Get concatenated or batched event segment data.
+        
+        Args:
+            start_idx: Index of first segment to include
+            num_chunks: Number of segments to include (None for all available from start_idx)
+            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            transpose: Whether to transpose from (Channel x Time) to (Time x Channel)
+                      Default is False, which returns (Time x Channel) when concatenated
+            chunks_per_batch_item: Number of chunks/segments to combine into each batch item
+            use_relative_time: Whether to use relative time (True) or absolute time (False)
+            
+        Returns:
+            Tuple of (data, time_arrays, event_labels) with consistent shape:
+            - If batch_size is None and transpose=False: (time_steps, channels)
+            - If batch_size is None and transpose=True: (channels, time_steps)
+            - If batch_size is specified and transpose=False: (batch_size, time_steps, channels)
+            - If batch_size is specified and transpose=True: (batch_size, channels, time_steps)
+        """
+        if not self.data:
+            logger.warning("No data available in EventSegmentDataset")
+            return np.array([]), np.array([]), np.array([])
+        
+        # Determine how many segments to process
+        end_idx = len(self.data) if num_chunks is None else min(start_idx + num_chunks, len(self.data))
+        segments_to_process = list(range(start_idx, end_idx))
+        
+        if not segments_to_process:
+            logger.warning(f"No valid segments in range start_idx={start_idx}, num_chunks={num_chunks}")
+            return np.array([]), np.array([]), np.array([])
+        
+        # Process data based on batching requirements
+        if batch_size is None:
+            # If chunks_per_batch_item is 1, handle as before
+            if chunks_per_batch_item == 1:
+                # Concatenate all requested segments
+                data_segments = [self.data[i] for i in segments_to_process]
+                # Use relative or absolute time based on parameter
+                time_segments = [self.rel_time_arrays[i] if use_relative_time else self.time_arrays[i] for i in segments_to_process]
+                event_segments = [self.event_labels[i] for i in segments_to_process]
+                
+                # Concatenate along time dimension (axis=1 for Channel x Time)
+                concatenated_data = np.concatenate(data_segments, axis=1)
+                concatenated_time = np.concatenate(time_segments)
+                concatenated_events = np.concatenate(event_segments)
+                
+                # Transpose if requested (to Time x Channel)
+                if transpose:
+                    concatenated_data = concatenated_data.T
+                
+                return concatenated_data, concatenated_time, concatenated_events
+            else:
+                # Group segments into batch items based on chunks_per_batch_item
+                total_batch_items = len(segments_to_process) // chunks_per_batch_item
+                if total_batch_items == 0:
+                    logger.warning(f"Not enough segments for a single batch item (have {len(segments_to_process)}, need {chunks_per_batch_item})")
+                    return np.array([]), np.array([]), np.array([])
+                
+                batch_items_data = []
+                batch_items_time = []
+                batch_items_events = []
+                
+                # Process each group of segments
+                for i in range(total_batch_items):
+                    segment_group = segments_to_process[i * chunks_per_batch_item:(i + 1) * chunks_per_batch_item]
+                    
+                    # Combine segments in this group
+                    group_data_segments = [self.data[j] for j in segment_group]
+                    # Use relative or absolute time based on parameter
+                    group_time_segments = [self.rel_time_arrays[j] if use_relative_time else self.time_arrays[j] for j in segment_group]
+                    group_event_segments = [self.event_labels[j] for j in segment_group]
+                    
+                    # Concatenate this group along time dimension (axis=1 for Channel x Time)
+                    group_data = np.concatenate(group_data_segments, axis=1)
+                    group_time = np.concatenate(group_time_segments)
+                    group_events = np.concatenate(group_event_segments)
+                    
+                    # Transpose if needed
+                    if transpose:
+                        group_data = group_data.T
+                    
+                    batch_items_data.append(group_data)
+                    batch_items_time.append(group_time)
+                    batch_items_events.append(group_events)
+                
+                # Since batch_size is None, concatenate all batch items
+                # We need to handle the axis differently depending on transpose
+                if transpose:
+                    # For transpose=True, data is already (Time x Channel) in each item
+                    # So concatenate on axis=0 (stacking time dimensions)
+                    all_data = np.concatenate(batch_items_data, axis=0)
+                else:
+                    # For transpose=False, data is (Channel x Time) in each item
+                    # So concatenate on axis=1 (stacking time dimensions)
+                    all_data = np.concatenate(batch_items_data, axis=1)
+                
+                all_time = np.concatenate(batch_items_time)
+                all_events = np.concatenate(batch_items_events)
+                
+                return all_data, all_time, all_events
+        else:
+            # Calculate number of batch items needed
+            total_batch_items = len(segments_to_process) // chunks_per_batch_item
+            
+            # Calculate number of batches based on batch items
+            num_batches = total_batch_items // batch_size
+            
+            if num_batches == 0:
+                logger.warning(f"Not enough segments for a single batch (have {total_batch_items} batch items, need {batch_size})")
+                return np.array([]), np.array([]), np.array([])
+            
+            # Initialize batch arrays
+            batch_data = []
+            batch_times = []
+            batch_events = []
+            
+            # Process each batch
+            for b in range(num_batches):
+                batch_items = list(range(b * batch_size, (b + 1) * batch_size))
+                
+                # Process each batch item
+                batch_item_data = []
+                batch_item_times = []
+                batch_item_events = []
+                
+                for item_idx in batch_items:
+                    # Get segments for this batch item
+                    start_segment = start_idx + (item_idx * chunks_per_batch_item)
+                    end_segment = start_segment + chunks_per_batch_item
+                    item_segments = list(range(start_segment, min(end_segment, len(self.data))))
+                    
+                    # Skip if no valid segments
+                    if not item_segments:
+                        continue
+                    
+                    # Concatenate segments for this batch item
+                    item_data_segments = [self.data[j] for j in item_segments]
+                    # Use relative or absolute time based on parameter
+                    item_time_segments = [self.rel_time_arrays[j] if use_relative_time else self.time_arrays[j] for j in item_segments]
+                    item_event_segments = [self.event_labels[j] for j in item_segments]
+                    
+                    item_data = np.concatenate(item_data_segments, axis=1)
+                    item_time = np.concatenate(item_time_segments)
+                    item_events = np.concatenate(item_event_segments)
+                    
+                    # Transpose if needed
+                    if transpose:
+                        item_data = item_data.T
+                        
+                    batch_item_data.append(item_data)
+                    batch_item_times.append(item_time)
+                    batch_item_events.append(item_events)
+                
+                if batch_item_data:
+                    # Stack all items in this batch
+                    batch_data.append(np.stack(batch_item_data))
+                    batch_times.append(np.stack(batch_item_times))
+                    batch_events.append(np.stack(batch_item_events))
+            
+            if not batch_data:
+                logger.warning("No valid batches created")
+                return np.array([]), np.array([]), np.array([])
+                
+            # Stack all batches
+            batched_data = np.stack(batch_data)
+            batched_times = np.stack(batch_times)
+            batched_events = np.stack(batch_events)
+            
+            return batched_data, batched_times, batched_events
 
 def extract_band_power(data: np.ndarray, 
                       sfreq: float, 
@@ -701,13 +1570,13 @@ def map_events_to_windows(event_array: np.ndarray,
     Map event array to windows based on window center times
     
     Args:
-        event_array: Event array for raw data (samples)
+        event_array: Event array for raw data (samples) with values 0, 1, 2, 3
         window_times: Array of window center times
         sfreq: Sampling frequency
         window_size_ms: Window size in milliseconds
         
     Returns:
-        Array of event labels for windows
+        Array of event labels for windows (preserving event types 1, 2, 3)
     """
     window_events = np.zeros(len(window_times))
     
@@ -722,9 +1591,17 @@ def map_events_to_windows(event_array: np.ndarray,
         start_sample = max(0, central_sample_idx - half_window)
         end_sample = min(len(event_array), central_sample_idx + half_window)
         
-        # If any sample in the window has an event, mark the window
-        if start_sample < end_sample and np.any(event_array[start_sample:end_sample] > 0):
-            window_events[i] = 1
+        # Extract event window
+        window = event_array[start_sample:end_sample]
+        
+        # If any events in window, find the most important one (prioritize type 3, then 2, then 1)
+        if np.any(window > 0):
+            if np.any(window == 3):
+                window_events[i] = 3  # Both bands (highest priority)
+            elif np.any(window == 2):
+                window_events[i] = 2  # High band
+            else:
+                window_events[i] = 1  # Low band
     
     return window_events
 
@@ -754,13 +1631,14 @@ def extract_event_segments(files: List[str], config: dict, max_event_segments: O
     })
     
     # Get segment parameters
-    segment_params = config.get('event_segment', {
-        'pre_event': 1000,  # ms before event
-        'post_event': 1000  # ms after event
+    segment_params = config.get('event_segments', {
+        'fixed_segment_length_ms': 100,  # All segments will have exactly this length
+        'min_duration_ms': 20           # Minimum event duration to include
     })
     
-    pre_event = segment_params.get('pre_event', 1000)
-    post_event = segment_params.get('post_event', 1000)
+    # Get segment length parameters
+    fixed_segment_length_ms = segment_params.get('fixed_segment_length_ms', 100)
+    min_duration_ms = segment_params.get('min_duration_ms', 20)
     
     total_segments = 0
     all_segment_files = []
@@ -786,107 +1664,304 @@ def extract_event_segments(files: List[str], config: dict, max_event_segments: O
             sfreq = raw.info['sfreq']
             ch_names = raw.ch_names
             
+            # Calculate length parameters in samples
+            fixed_segment_length_samples = int(fixed_segment_length_ms * sfreq / 1000)
+            min_duration_samples = int(min_duration_ms * sfreq / 1000)
+            
             # Detect events
             logger.info(f"Detecting events in {os.path.basename(file)}")
-            event_array = detect_interictal_events(
+            
+            # Get low band and high band event arrays
+            low_band = event_params.get('low_band', [80, 250])
+            high_band = event_params.get('high_band', [250, 451])
+            rel_thresh = event_params.get('rel_thresh', 3.0)
+            abs_thresh = event_params.get('abs_thresh', 3.0)
+            min_gap = event_params.get('min_gap', 20)
+            min_last = event_params.get('min_last', 20)  # in milliseconds
+            
+            logger.info(f"Using event detection parameters: rel_thresh={rel_thresh}, abs_thresh={abs_thresh}, min_gap={min_gap}ms, min_last={min_last}ms")
+            
+            # Detect events for low band
+            logger.info(f"Detecting low-band events in frequency range: {low_band} Hz")
+            
+            # Detect events for both datasets
+            file_low_band_events = detect_interictal_events(
                 data, 
                 sfreq,
                 ch_names, 
-                freq_band=event_params.get('low_band', [80, 250]),
-                rel_thresh=event_params.get('rel_thresh', 3.0),
-                abs_thresh=event_params.get('abs_thresh', 3.0),
-                min_gap=event_params.get('min_gap', 20),
-                min_last=event_params.get('min_last', 20)
+                freq_band=low_band,
+                rel_thresh=rel_thresh,
+                abs_thresh=abs_thresh,
+                min_gap=min_gap,
+                min_last=min_last  # keep as milliseconds
             )
             
-            # If no events found, skip to next file
-            if np.sum(event_array) == 0:
+            # Detect high-band events
+            logger.info(f"Detecting high-band events in frequency range: {high_band} Hz")
+            file_high_band_events = detect_interictal_events(
+                data, 
+                sfreq,
+                ch_names, 
+                freq_band=high_band,
+                rel_thresh=rel_thresh,
+                abs_thresh=abs_thresh,
+                min_gap=min_gap,
+                min_last=min_last  # keep as milliseconds
+            )
+            
+            # Combine events: where both bands have events, mark as type 3
+            file_combined_events = np.zeros_like(file_low_band_events)
+            file_combined_events[file_low_band_events > 0] = 1  # Low band
+            file_combined_events[file_high_band_events > 0] = 2  # High band
+            
+            # Where both bands have events, mark as type 3
+            both_bands = (file_low_band_events > 0) & (file_high_band_events > 0)
+            file_combined_events[both_bands] = 3  # Both bands
+            
+            # Find contiguous event regions
+            combined_events = find_contiguous_events(file_combined_events)
+            
+            # Log event counts to diagnose potential inconsistencies
+            logger.info(f"Found {len(combined_events)} combined events in {os.path.basename(file)}")
+            
+            if not combined_events:
                 logger.info(f"No events detected in {os.path.basename(file)}")
                 continue
-                
-            # Find start indices of each event
-            event_indices = np.where(np.diff(np.concatenate([[0], event_array])) == 1)[0]
             
-            if len(event_indices) == 0:
-                logger.info(f"No events detected in {os.path.basename(file)}")
-                continue
-                
-            logger.info(f"Found {len(event_indices)} events in {os.path.basename(file)}")
-            
-            # Calculate segment samples
-            pre_event_samples = int(pre_event * sfreq / 1000)
-            post_event_samples = int(post_event * sfreq / 1000)
-            segment_length = pre_event_samples + post_event_samples
-            
-            # Extract segments
-            n_events = len(event_indices)
+            # Process all event regions
             file_segments = []
+            segment_event_types = []
+            segment_start_idx = []
+            segment_end_idx = []
             
-            for i, event_idx in enumerate(event_indices):
-                # Check if we need more segments
-                if max_event_segments is not None and total_segments >= max_event_segments:
-                    break
-                    
-                # Calculate segment boundaries
-                start_idx = max(0, event_idx - pre_event_samples)
-                end_idx = min(data.shape[1], event_idx + post_event_samples)
+            # Process each combined event region
+            for event_idx, (start_idx, end_idx) in enumerate(combined_events):
+                # Determine the event type at this position
+                if file_combined_events[start_idx] == 3:
+                    event_type = 3  # Both bands
+                elif file_combined_events[start_idx] == 2:
+                    event_type = 2  # High band
+                else:
+                    event_type = 1  # Low band
                 
-                # Skip if segment would be incomplete
-                if end_idx - start_idx < segment_length * 0.9:  # Allow some tolerance
+                # Get the actual event duration
+                event_duration = end_idx - start_idx
+                
+                # Skip if event is too short (below minimum duration)
+                if event_duration < min_duration_samples:
+                    logger.debug(f"Skipping event {event_idx} (too short: {event_duration/sfreq*1000:.1f}ms < {min_duration_ms}ms)")
                     continue
-                    
-                # Extract segment
-                segment = data[:, start_idx:end_idx]
                 
-                # Pad if needed
-                if segment.shape[1] < segment_length:
-                    pad_before = max(0, pre_event_samples - (event_idx - start_idx))
-                    pad_after = max(0, segment_length - segment.shape[1] - pad_before)
-                    segment = np.pad(segment, ((0, 0), (pad_before, pad_after)), mode='constant')
+                # Calculate segment boundaries to get exactly fixed_segment_length_samples
+                if event_duration <= fixed_segment_length_samples:
+                    # Event is shorter than the desired segment length
+                    # Center the event in the segment
+                    event_center = (start_idx + end_idx) // 2
+                    half_segment = fixed_segment_length_samples // 2
+                    
+                    # Center the segment on the event
+                    segment_start = max(0, event_center - half_segment)
+                    segment_end = segment_start + fixed_segment_length_samples
+                    
+                    # Adjust if we go beyond the data bounds
+                    if segment_end > len(file_combined_events):
+                        segment_end = len(file_combined_events)
+                        segment_start = max(0, segment_end - fixed_segment_length_samples)
+                else:
+                    # Event is longer than the desired segment length
+                    # Center on the event
+                    event_center = (start_idx + end_idx) // 2
+                    half_segment = fixed_segment_length_samples // 2
+                    
+                    # Center the segment on the event
+                    segment_start = max(0, event_center - half_segment)
+                    segment_end = segment_start + fixed_segment_length_samples
+                    
+                    # Adjust if we go beyond the data bounds
+                    if segment_end > len(file_combined_events):
+                        segment_end = len(file_combined_events)
+                        segment_start = max(0, segment_end - fixed_segment_length_samples)
+                
+                # Ensure exact segment length
+                actual_length = segment_end - segment_start
+                if actual_length < fixed_segment_length_samples:
+                    # This can happen at file boundaries - skip segments that are too short
+                    logger.debug(f"Skipping event segment (cannot get full length: {actual_length} < {fixed_segment_length_samples})")
+                    continue
+                
+                # Extract segment
+                segment = data[:, segment_start:segment_end]
+                
+                # Create event labels for the segment - preserves the actual event positions
+                segment_events = np.zeros(segment_end - segment_start)
+                
+                # Map original event positions to segment positions
+                rel_start = start_idx - segment_start
+                rel_end = end_idx - segment_start
+                
+                # Make sure we're within bounds
+                if rel_end > 0 and rel_start < len(segment_events):
+                    rel_start = max(0, rel_start)
+                    rel_end = min(len(segment_events), rel_end)
+                    # Set event labels for the actual event duration
+                    segment_events[rel_start:rel_end] = event_type
                 
                 # Add to list
                 file_segments.append(segment)
+                segment_event_types.append(event_type)
+                segment_start_idx.append(segment_start)
+                segment_end_idx.append(segment_end)
                 
-                # Increment total count
+                # Update counter
                 total_segments += 1
                 
-                # Periodically report progress
-                if i % 100 == 0 and i > 0:
-                    logger.info(f"  Processed {i}/{n_events} events, extracted {len(file_segments)} segments")
+                # Check if we've reached the maximum
+                if max_event_segments is not None and total_segments >= max_event_segments:
+                    break
             
             # If we found segments in this file, add to dataset
             if file_segments:
-                # Stack segments for this file
-                file_segments_array = np.stack(file_segments, axis=0)
+                # Generate absolute time arrays for each segment
+                segment_abs_times = []
+                segment_rel_times = []
+                segment_events_list = []
+                segment_day_night = []
                 
-                # Add to dataset
-                segment_indices = list(range(total_segments - len(file_segments), total_segments))
-                segment_files = [file] * len(file_segments)
+                for i, (segment, start_idx, end_idx) in enumerate(zip(file_segments, segment_start_idx, segment_end_idx)):
+                    # Generate absolute time array for this segment
+                    segment_length = segment.shape[1]
+                    
+                    # Generate time array (absolute time from file timestamp)
+                    abs_time = generate_time_array(
+                        timestamp,
+                        segment_length,
+                        sfreq,
+                        reference_time=None  # Use file timestamp as reference
+                    )
+                    
+                    # Adjust the time to start from the segment's start sample
+                    start_time_offset = start_idx / sfreq
+                    abs_time = abs_time + start_time_offset
+                    
+                    # Create relative time array starting from 0
+                    rel_time = np.arange(segment_length) / sfreq
+                    
+                    # Create event labels - mark the actual event positions
+                    event_labels = np.zeros(segment_length)
+                    
+                    # Map original event positions to segment positions
+                    rel_start = start_idx - start_idx  # Will be 0
+                    rel_end = end_idx - start_idx
+                    
+                    # Make sure we're within bounds
+                    if rel_end > 0 and rel_start < segment_length:
+                        rel_start = max(0, rel_start)
+                        rel_end = min(segment_length, rel_end)
+                        # Set event labels for the actual event duration
+                        event_labels[rel_start:rel_end] = segment_event_types[i]
+                    
+                    # Create day/night labels
+                    day_night_labels = generate_day_night_labels(
+                        abs_time,
+                        night_start_hour=event_segment_dataset.night_start_hour,
+                        night_end_hour=event_segment_dataset.night_end_hour,
+                        reference_time=None  # Use absolute timestamps directly
+                    )
+                    
+                    segment_abs_times.append(abs_time)
+                    segment_rel_times.append(rel_time)
+                    segment_events_list.append(event_labels)
+                    segment_day_night.append(day_night_labels)
                 
-                event_segment_dataset.add_segments(file_segments_array, segment_indices, segment_files)
+                # Create source information
+                segment_sources = []
+                for i, (segment, start_idx, end_idx) in enumerate(zip(file_segments, segment_start_idx, segment_end_idx)):
+                    source_info = {
+                        'file': file,
+                        'segment_idx': total_segments - len(file_segments) + i,
+                        'start_sample': start_idx,
+                        'end_sample': end_idx,
+                        'shape': segment.shape,
+                        'event_type': segment_event_types[i]
+                    }
+                    segment_sources.append(source_info)
                 
-                all_segment_files.extend(segment_files)
-                all_segment_indices.extend(segment_indices)
+                # Add all segments to the dataset
+                for i, segment in enumerate(file_segments):
+                    event_segment_dataset.add_segment(
+                        segment,
+                        segment_abs_times[i],
+                        segment_rel_times[i],
+                        segment_events_list[i],
+                        segment_day_night[i],
+                        segment_sources[i]
+                    )
                 
-                logger.info(f"Added {len(file_segments)} segments from {os.path.basename(file)}")
+                all_segment_files.extend([file] * len(file_segments))
+                all_segment_indices.extend(list(range(total_segments - len(file_segments), total_segments)))
+                
+                logger.info(f"Added {len(file_segments)} segments from {os.path.basename(file)}: {sum(t==1 for t in segment_event_types)} type 1, {sum(t==2 for t in segment_event_types)} type 2, {sum(t==3 for t in segment_event_types)} type 3")
                 
         except Exception as e:
             logger.error(f"Error processing file {file}: {e}")
             import traceback
             traceback.print_exc()
     
-    logger.info(f"Total segments extracted: {total_segments}")
+    # Count event types
+    type1_count = 0
+    type2_count = 0
+    type3_count = 0
+    
+    if event_segment_dataset.event_labels:
+        for labels in event_segment_dataset.event_labels:
+            type1_count += np.sum(labels == 1)
+            type2_count += np.sum(labels == 2)
+            type3_count += np.sum(labels == 3)
+    
+    logger.info(f"Event types: {type1_count} type 1 (low band), {type2_count} type 2 (high band), {type3_count} type 3 (both bands)")
     
     # Store metadata
     event_segment_dataset.set_metadata({
         'segment_files': all_segment_files,
         'segment_indices': all_segment_indices,
-        'pre_event_ms': pre_event,
-        'post_event_ms': post_event,
+        'fixed_segment_length_ms': fixed_segment_length_ms,
+        'min_duration_ms': min_duration_ms,
         'extraction_config': config
     })
     
     return event_segment_dataset
+
+def find_contiguous_events(event_array):
+    """
+    Find contiguous event regions in a binary event array
+    
+    Args:
+        event_array: Binary array where 1 indicates an event
+        
+    Returns:
+        List of (start_idx, end_idx) tuples for each contiguous event
+    """
+    # Find transitions (0->1 or 1->0)
+    transitions = np.diff(np.concatenate([[0], event_array.astype(int), [0]]))
+    
+    # Rising edges (start of events)
+    rise_indices = np.where(transitions == 1)[0]
+    
+    # Falling edges (end of events)
+    fall_indices = np.where(transitions == -1)[0]
+    
+    if len(rise_indices) != len(fall_indices):
+        # This shouldn't happen, but just in case
+        logger.warning(f"Mismatched event transitions: {len(rise_indices)} rises vs {len(fall_indices)} falls")
+        # Use the minimum to avoid indexing errors
+        min_len = min(len(rise_indices), len(fall_indices))
+        rise_indices = rise_indices[:min_len]
+        fall_indices = fall_indices[:min_len]
+    
+    # Create pairs of (start, end) indices
+    event_regions = list(zip(rise_indices, fall_indices))
+    
+    return event_regions
 
 def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset], Optional[BandpowerDataset], Optional[EventSegmentDataset]]:
     """
@@ -940,8 +2015,13 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
         'night_end_hour': 6      # 6AM
     })
     
-    # Event segment parameters (optional)
-    max_event_segments = config.get('max_event_segments', config.get('event_segment', {}).get('max_event_segments'))
+    # Event segment parameters
+    event_segment_params = config.get('event_segments', {})
+    
+    # Maximum event segments to extract (check in multiple places)
+    max_event_segments = config.get('max_event_segments')
+    if max_event_segments is None:
+        max_event_segments = event_segment_params.get('max_segments_per_file')
     
     # Create output directory
     os.makedirs(save_dir, exist_ok=True)
@@ -961,17 +2041,44 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
         event_segment_dataset = EventSegmentDataset(config)
     
     # Find files
-    files = sorted(glob(os.path.join(data_dir, "*.fif")))
+    file_paths = glob(os.path.join(data_dir, "*.fif"))
     
-    if not files:
+    if not file_paths:
         logger.error(f"No files found in {data_dir}")
         return raw_dataset, bandpower_dataset, event_segment_dataset
+    
+    # Sort files chronologically by actual timestamp in the filename
+    # instead of lexicographically
+    files_with_timestamps = []
+    
+    for file_path in file_paths:
+        try:
+            timestamp = parse_timestamp_from_filename(file_path)
+            files_with_timestamps.append((file_path, timestamp))
+        except ValueError as e:
+            logger.error(f"Error parsing timestamp from {file_path}: {e}")
+            continue
+    
+    # Sort by actual timestamp
+    files_with_timestamps.sort(key=lambda x: x[1])  # Sort by timestamp
+    
+    # Extract sorted file paths
+    files = [f[0] for f in files_with_timestamps]
+    
+    logger.info(f"Found and chronologically sorted {len(files)} files to process")
+    
+    # Log the first few files to verify sorting
+    for i in range(min(5, len(files))):
+        try:
+            timestamp = parse_timestamp_from_filename(files[i])
+            logger.info(f"File {i+1}: {os.path.basename(files[i])} - Timestamp: {timestamp}")
+        except Exception:
+            logger.info(f"File {i+1}: {os.path.basename(files[i])}")
     
     # Apply max_files limit if specified
     if max_files is not None:
         files = files[:max_files]
-    
-    logger.info(f"Found {len(files)} files to process")
+        logger.info(f"Limiting to first {max_files} files")
     
     # Get reference time from first file if not specified
     reference_time = None
@@ -1035,351 +2142,390 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
                 reference_time=reference_time
             )
             
+            # *** Process entire file for event detection first ***
+            # Detect events on the entire original data (before any chunking or resampling)
+            logger.info(f"Detecting events on entire file (original data)")
+            
+            # Get detection parameters 
+            low_band = event_params.get('low_band', [80, 250])
+            high_band = event_params.get('high_band', [250, 451])
+            rel_thresh = event_params.get('rel_thresh', 3.0)
+            abs_thresh = event_params.get('abs_thresh', 3.0)
+            min_gap = event_params.get('min_gap', 20)
+            min_last = event_params.get('min_last', 20)  # in milliseconds
+            
+            logger.info(f"Using event detection parameters: rel_thresh={rel_thresh}, abs_thresh={abs_thresh}, min_gap={min_gap}ms, min_last={min_last}ms")
+            
+            # Detect low-band events
+            logger.info(f"Detecting low-band events in frequency range: {low_band} Hz")
+            
+            # Detect events for both datasets
+            file_low_band_events = detect_interictal_events(
+                original_data, 
+                original_sfreq,
+                ch_names, 
+                freq_band=low_band,
+                rel_thresh=rel_thresh,
+                abs_thresh=abs_thresh,
+                min_gap=min_gap,
+                min_last=min_last  # keep as milliseconds
+            )
+            
+            # Detect high-band events
+            logger.info(f"Detecting high-band events in frequency range: {high_band} Hz")
+            file_high_band_events = detect_interictal_events(
+                original_data, 
+                original_sfreq,
+                ch_names, 
+                freq_band=high_band,
+                rel_thresh=rel_thresh,
+                abs_thresh=abs_thresh,
+                min_gap=min_gap,
+                min_last=min_last  # keep as milliseconds
+            )
+            
+            # Combine events: where both bands have events, mark as type 3
+            file_combined_events = np.zeros_like(file_low_band_events)
+            file_combined_events[file_low_band_events > 0] = 1  # Low band
+            file_combined_events[file_high_band_events > 0] = 2  # High band
+            
+            # Where both bands have events, mark as type 3
+            both_bands = (file_low_band_events > 0) & (file_high_band_events > 0)
+            file_combined_events[both_bands] = 3  # Both bands
+            
+            # Find contiguous event regions for debugging
+            low_band_regions = find_contiguous_events(file_low_band_events)
+            high_band_regions = find_contiguous_events(file_high_band_events)
+            combined_regions = find_contiguous_events(file_combined_events)
+            
+            # Calculate file duration and count distinct events
+            file_duration_sec = n_samples_original / original_sfreq
+            event_counts = count_distinct_events(file_combined_events)
+            total_events = sum(event_counts.values())
+            total_duration_sec += file_duration_sec
+            
+            logger.info(f"File duration: {file_duration_sec/60:.1f} minutes ({file_duration_sec:.1f} seconds)")
+            logger.info(f"Found {total_events} distinct events: {event_counts[1]} low-band only, {event_counts[2]} high-band only, {event_counts[3]} dual-band")
+            logger.info(f"Found {len(low_band_regions)} low-band regions, {len(high_band_regions)} high-band regions, {len(combined_regions)} combined regions")
+            
             # Calculate chunk size in samples and number of chunks
             chunk_samples = int(chunk_size_sec * original_sfreq)
             n_chunks = max(1, n_samples_original // chunk_samples)
             
-            # Calculate file duration
-            file_duration_sec = n_samples_original / original_sfreq
-            logger.info(f"  File duration: {file_duration_sec/60:.1f} minutes ({file_duration_sec:.1f} seconds)")
-            
-            # Process data in chunks
-            for chunk_idx in range(n_chunks):
-                # Calculate chunk boundaries
-                start_sample = chunk_idx * chunk_samples
-                end_sample = min(n_samples_original, (chunk_idx + 1) * chunk_samples)
-                
-                # Skip chunk if it's too small
-                if end_sample - start_sample < chunk_samples / 2:
-                    logger.info(f"  Skipping chunk {chunk_idx+1}/{n_chunks} (too small: {end_sample-start_sample} samples)")
-                    continue
-                
-                # Calculate chunk duration and update total
-                chunk_duration_sec = (end_sample - start_sample) / original_sfreq
-                total_duration_sec += chunk_duration_sec
-                
-                logger.info(f"  Processing chunk {chunk_idx+1}/{n_chunks} ({end_sample-start_sample} samples, {chunk_duration_sec:.1f} sec)")
-                
-                # Extract chunk data and time array
-                chunk_data = original_data[:, start_sample:end_sample]
-                chunk_time = time_array_original[start_sample:end_sample]
-                chunk_day_night = day_night_original[start_sample:end_sample]
-                
-                # Detect events on chunk data
-                logger.info(f"  Detecting events on chunk (original data)")
-                chunk_events = detect_interictal_events(
-                    chunk_data, 
-                    original_sfreq,
-                    ch_names, 
-                    freq_band=event_params.get('low_band', [80, 250]),
-                    rel_thresh=event_params.get('rel_thresh', 3.0),
-                    abs_thresh=event_params.get('abs_thresh', 3.0),
-                    min_gap=event_params.get('min_gap', 20),
-                    min_last=event_params.get('min_last', 20),
-                    start_time=(timestamp - reference_time).total_seconds() if reference_time else 0
-                )
-                
-                # Process bandpower using ORIGINAL chunk data if needed
-                if create_bandpower_dataset:
-                    logger.info(f"  Calculating bandpower on chunk (original data)")
-                    # Process each band
-                    band_data = {}
-                    for band_name, band_range in bandpower_params['bands'].items():
-                        band_power, window_times = extract_band_power(
-                            chunk_data,       # Use original chunk data
-                            original_sfreq,   # Use original sampling rate
-                            band_range,
-                            bandpower_params['window_size_ms'],
-                            bandpower_params['overlap']
+            # Process data in chunks for raw and bandpower datasets
+            if create_raw_dataset or create_bandpower_dataset:
+                for chunk_idx in range(n_chunks):
+                    # Calculate chunk boundaries
+                    start_sample = chunk_idx * chunk_samples
+                    end_sample = min(n_samples_original, (chunk_idx + 1) * chunk_samples)
+                    
+                    # Skip chunk if it's too small
+                    if end_sample - start_sample < chunk_samples / 2:
+                        logger.info(f"  Skipping chunk {chunk_idx+1}/{n_chunks} (too small: {end_sample-start_sample} samples)")
+                        continue
+                    
+                    # Calculate chunk duration
+                    chunk_duration_sec = (end_sample - start_sample) / original_sfreq
+                    
+                    logger.info(f"  Processing chunk {chunk_idx+1}/{n_chunks} ({end_sample-start_sample} samples, {chunk_duration_sec:.1f} sec)")
+                    
+                    # Extract chunk data and time array
+                    chunk_data = original_data[:, start_sample:end_sample]
+                    chunk_time = time_array_original[start_sample:end_sample]
+                    chunk_day_night = day_night_original[start_sample:end_sample]
+                    
+                    # Extract chunk events from the whole-file event arrays - use combined events
+                    # IMPORTANT: Make sure to correctly slice the events array
+                    chunk_events = np.copy(file_combined_events[start_sample:end_sample])
+                    
+                    # Debug event counts in chunk - this helps diagnose if events are being lost
+                    chunk_event_regions = find_contiguous_events(chunk_events)
+                    chunk_event_counts = count_distinct_events(chunk_events)
+                    total_chunk_events = sum(chunk_event_counts.values())
+                    
+                    logger.info(f"  Chunk contains {total_chunk_events} distinct events: " +
+                               f"{chunk_event_counts[1]} low-band, {chunk_event_counts[2]} high-band, " + 
+                               f"{chunk_event_counts[3]} dual-band, in {len(chunk_event_regions)} regions")
+                    
+                    # Process bandpower using ORIGINAL chunk data if needed
+                    if create_bandpower_dataset:
+                        logger.info(f"  Calculating bandpower on chunk (original data)")
+                        # Process each band
+                        band_data = {}
+                        for band_name, band_range in bandpower_params['bands'].items():
+                            logger.info(f"  Calculating bandpower for {band_name}: {band_range} Hz")
+                            band_power, window_times = extract_band_power(
+                                chunk_data,       # Use original chunk data
+                                original_sfreq,   # Use original sampling rate
+                                band_range,
+                                bandpower_params['window_size_ms'],
+                                bandpower_params['overlap']
+                            )
+                            
+                            # Adjust window times to be relative to reference time
+                            if reference_time:
+                                time_offset = (timestamp - reference_time).total_seconds() + start_sample / original_sfreq
+                                window_times += time_offset
+                            
+                            band_data[band_name] = band_power
+                        
+                        # Get window day/night labels based on time array
+                        if band_data:
+                            window_day_night = generate_day_night_labels(
+                                window_times,
+                                night_start_hour=bandpower_params.get('night_start_hour', 20),
+                                night_end_hour=bandpower_params.get('night_end_hour', 6),
+                                reference_time=reference_time
+                            )
+                            
+                            # Map events to windows - pass the combined events
+                            window_events = map_events_to_windows(
+                                chunk_events,
+                                window_times,
+                                original_sfreq,
+                                bandpower_params['window_size_ms']
+                            )
+                            
+                            # Debug window event counts
+                            window_event_counts = {}
+                            for event_type in [1, 2, 3]:
+                                window_event_counts[event_type] = np.sum(window_events == event_type)
+                            
+                            logger.info(f"  Mapped {sum(window_event_counts.values())} events to windows: " +
+                                      f"{window_event_counts[1]} low-band, {window_event_counts[2]} high-band, " + 
+                                      f"{window_event_counts[3]} dual-band")
+                            
+                            # Add to bandpower dataset
+                            bandpower_dataset.add_chunk(
+                                band_data,
+                                window_times,
+                                window_events,
+                                window_day_night,
+                                [file_idx],
+                                [file]
+                            )
+                            
+                            # Update bandpower count
+                            total_bandpower_windows += len(window_times)
+                    
+                    # Process raw data with optional resampling
+                    if create_raw_dataset:
+                        # Get resampling parameters
+                        resample_freq = raw_params.get('resample_freq')
+                        
+                        # Resample if needed
+                        if resample_freq is not None and abs(resample_freq - original_sfreq) > 1e-6:
+                            logger.info(f"  Resampling chunk from {original_sfreq} Hz to {resample_freq} Hz")
+                            # Create MNE Raw object for this chunk
+                            chunk_info = raw.info.copy()
+                            chunk_raw = mne.io.RawArray(chunk_data, chunk_info)
+                            chunk_raw = chunk_raw.resample(resample_freq)
+                            resampled_data = chunk_raw.get_data()
+                            resampled_sfreq = resample_freq
+                        else:
+                            # No resampling needed
+                            resampled_data = chunk_data.copy()
+                            resampled_sfreq = original_sfreq
+                            logger.info(f"  Using original chunk data ({original_sfreq} Hz)")
+                        
+                        # Generate time array for resampled data
+                        n_samples_resampled = resampled_data.shape[1]
+                        chunk_duration = (end_sample - start_sample) / original_sfreq
+                        
+                        # Create evenly spaced time points for the resampled data
+                        chunk_start_time = chunk_time[0]
+                        resampled_time = np.linspace(
+                            chunk_start_time,
+                            chunk_start_time + chunk_duration,
+                            n_samples_resampled
                         )
                         
-                        # Adjust window times to be relative to reference time
-                        if reference_time:
-                            time_offset = (timestamp - reference_time).total_seconds() + start_sample / original_sfreq
-                            window_times += time_offset
-                        
-                        band_data[band_name] = band_power
-                    
-                    # Get window day/night labels based on time array
-                    if band_data:
-                        window_day_night = generate_day_night_labels(
-                            window_times,
-                            night_start_hour=bandpower_params.get('night_start_hour', 20),
-                            night_end_hour=bandpower_params.get('night_end_hour', 6),
+                        # Generate day/night labels for resampled data
+                        resampled_day_night = generate_day_night_labels(
+                            resampled_time, 
+                            night_start_hour=raw_params.get('night_start_hour', 20),
+                            night_end_hour=raw_params.get('night_end_hour', 6),
                             reference_time=reference_time
                         )
                         
-                        # Map events to windows - using chunk events
-                        window_events = map_events_to_windows(
-                            chunk_events,
-                            window_times,
-                            original_sfreq,
-                            bandpower_params['window_size_ms']
-                        )
+                        # Map events to resampled data timepoints
+                        logger.info("  Mapping events to resampled data timepoints")
+                        resampled_events = np.zeros_like(resampled_time)
                         
-                        # Add to bandpower dataset
-                        bandpower_dataset.add_chunk(
-                            band_data,
-                            window_times,
-                            window_events,
-                            window_day_night,
+                        # Create a time mapping from original to resampled
+                        orig_times = np.linspace(0, chunk_duration, len(chunk_events))
+                        resampled_times = np.linspace(0, chunk_duration, n_samples_resampled)
+                        
+                        # For each type of event (1, 2, 3), find where it occurs and map to resampled timeline
+                        for event_type in [1, 2, 3]:
+                            # Find where this event type occurs in original data
+                            event_indices = np.where(chunk_events == event_type)[0]
+                            
+                            if len(event_indices) > 0:
+                                # For each event, map to nearest timepoint in resampled data
+                                for idx in event_indices:
+                                    # Get time of this event in seconds from chunk start
+                                    event_time = orig_times[idx]
+                                    
+                                    # Find nearest time in resampled timeline
+                                    nearest_idx = np.argmin(np.abs(resampled_times - event_time))
+                                    
+                                    # Set the event in resampled data
+                                    if 0 <= nearest_idx < len(resampled_events):
+                                        resampled_events[nearest_idx] = event_type
+                        
+                        # Count resampled events for debugging
+                        resampled_event_counts = {
+                            1: np.sum(resampled_events == 1),
+                            2: np.sum(resampled_events == 2),
+                            3: np.sum(resampled_events == 3)
+                        }
+                        
+                        logger.info(f"  Mapped {sum(resampled_event_counts.values())} events to resampled data: " +
+                                   f"{resampled_event_counts[1]} low-band, {resampled_event_counts[2]} high-band, " + 
+                                   f"{resampled_event_counts[3]} dual-band")
+                        
+                        # Add to raw dataset
+                        raw_dataset.add_chunk(
+                            resampled_data,
+                            resampled_time,
+                            resampled_events,
+                            resampled_day_night,
                             [file_idx],
                             [file]
                         )
                         
-                        # Update bandpower count
-                        total_bandpower_windows += len(window_times)
-                
-                # Process raw data with optional resampling
-                if create_raw_dataset:
-                    # Get resampling parameters
-                    resample_freq = raw_params.get('resample_freq')
-                    
-                    # Resample if needed
-                    if resample_freq is not None and abs(resample_freq - original_sfreq) > 1e-6:
-                        logger.info(f"  Resampling chunk from {original_sfreq} Hz to {resample_freq} Hz")
-                        # Create MNE Raw object for this chunk
-                        chunk_info = raw.info.copy()
-                        chunk_raw = mne.io.RawArray(chunk_data, chunk_info)
-                        chunk_raw = chunk_raw.resample(resample_freq)
-                        resampled_data = chunk_raw.get_data()
-                        resampled_sfreq = resample_freq
-                    else:
-                        # No resampling needed
-                        resampled_data = chunk_data.copy()
-                        resampled_sfreq = original_sfreq
-                        logger.info(f"  Using original chunk data ({original_sfreq} Hz)")
-                    
-                    # Generate time array for resampled data
-                    n_samples_resampled = resampled_data.shape[1]
-                    chunk_duration = (end_sample - start_sample) / original_sfreq
-                    
-                    # Create evenly spaced time points for the resampled data
-                    chunk_start_time = chunk_time[0]
-                    resampled_time = np.linspace(
-                        chunk_start_time,
-                        chunk_start_time + chunk_duration,
-                        n_samples_resampled
-                    )
-                    
-                    # Generate day/night labels for resampled data
-                    resampled_day_night = generate_day_night_labels(
-                        resampled_time, 
-                        night_start_hour=raw_params.get('night_start_hour', 20),
-                        night_end_hour=raw_params.get('night_end_hour', 6),
-                        reference_time=reference_time
-                    )
-                    
-                    # Map events to resampled data timepoints
-                    logger.info("  Mapping events to resampled data timepoints")
-                    resampled_events = np.zeros_like(resampled_time)
-                    
-                    # Map each original event sample to resampled time
-                    if np.any(chunk_events > 0):
-                        event_indices = np.where(chunk_events > 0)[0]
-                        
-                        for event_idx in event_indices:
-                            # Calculate time of this event in seconds
-                            event_time = chunk_time[event_idx]
-                            
-                            # Find closest time in resampled data
-                            closest_idx = np.argmin(np.abs(resampled_time - event_time))
-                            if 0 <= closest_idx < len(resampled_events):
-                                resampled_events[closest_idx] = 1
-                    
-                    # Add to raw dataset
-                    raw_dataset.add_chunk(
-                        resampled_data,
-                        resampled_time,
-                        resampled_events,
-                        resampled_day_night,
-                        [file_idx],
-                        [file]
-                    )
-                    
-                    # Update raw samples counter
-                    total_raw_samples += n_samples_resampled
-                
-                # Extract event segments if enabled (using original chunk data)
-                if create_event_segment_dataset:
-                    logger.info(f"  Extracting event segments from chunk")
-                    
-                    # Find event indices
-                    event_indices = np.where(np.diff(np.concatenate([[0], chunk_events])) == 1)[0]
-                    
-                    if len(event_indices) == 0:
-                        logger.info(f"  No events found in chunk")
-                        continue
-                    
-                    # Get segment parameters
-                    pre_event_ms = config.get('event_segments', {}).get('pre_event_ms', 1000)
-                    post_event_ms = config.get('event_segments', {}).get('post_event_ms', 1000)
-                    
-                    # Calculate segment samples
-                    pre_event_samples = int(pre_event_ms * original_sfreq / 1000)
-                    post_event_samples = int(post_event_ms * original_sfreq / 1000)
-                    segment_length = pre_event_samples + post_event_samples
-                    
-                    # Extract segments from chunk
-                    chunk_segments = []
-                    segment_indices = []
-                    segment_files = []
-                    segment_event_types = []
-                    
-                    # Get event detection bands
-                    low_band = event_params.get('low_band', [80, 250])
-                    high_band = event_params.get('high_band', [250, 451])
-                    
-                    # Detect events in different bands for classification
-                    # Use existing events from low_band detection
-                    low_band_events = chunk_events.copy() 
-                    
-                    # Detect events in high band
-                    high_band_events = detect_interictal_events(
-                        chunk_data, 
-                        original_sfreq,
-                        ch_names, 
-                        freq_band=high_band,
-                        rel_thresh=event_params.get('rel_thresh', 3.0),
-                        abs_thresh=event_params.get('abs_thresh', 3.0),
-                        min_gap=event_params.get('min_gap', 20),
-                        min_last=event_params.get('min_last', 20)
-                    )
-                    
-                    for i, event_idx in enumerate(event_indices):
-                        # Calculate segment boundaries relative to chunk
-                        start_idx = max(0, event_idx - pre_event_samples)
-                        end_idx = min(chunk_data.shape[1], event_idx + post_event_samples)
-                        
-                        # Skip if segment would be incomplete
-                        if end_idx - start_idx < segment_length * 0.9:  # Allow some tolerance
-                            continue
-                        
-                        # Extract segment
-                        segment = chunk_data[:, start_idx:end_idx]
-                        
-                        # Pad if needed
-                        if segment.shape[1] < segment_length:
-                            pad_before = max(0, pre_event_samples - (event_idx - start_idx))
-                            pad_after = max(0, segment_length - segment.shape[1] - pad_before)
-                            segment = np.pad(segment, ((0, 0), (pad_before, pad_after)), mode='constant')
-                        
-                        # Determine event type by checking high_band_events at this index
-                        # Check for high band event within a small window around this event
-                        window_start = max(0, event_idx - 10)
-                        window_end = min(len(high_band_events), event_idx + 10)
-                        
-                        # Determine event type
-                        if np.any(high_band_events[window_start:window_end] > 0):
-                            # Both bands have activity - type 3
-                            event_type = 3
-                        else:
-                            # Only low band has activity - type 1
-                            event_type = 1
-                        
-                        # Add to lists
-                        chunk_segments.append(segment)
-                        segment_indices.append(total_event_segments + len(chunk_segments) - 1)
-                        segment_files.append(file)
-                        segment_event_types.append(event_type)
-                    
-                    # Now check for high-band only events (type 2)
-                    high_band_event_indices = np.where(np.diff(np.concatenate([[0], high_band_events])) == 1)[0]
-                    
-                    for event_idx in high_band_event_indices:
-                        # Skip if this is also a low-band event (already processed)
-                        window_start = max(0, event_idx - 10) 
-                        window_end = min(len(low_band_events), event_idx + 10)
-                        
-                        if np.any(low_band_events[window_start:window_end] > 0):
-                            continue  # Skip as this was already counted as type 3
-                            
-                        # Calculate segment boundaries relative to chunk
-                        start_idx = max(0, event_idx - pre_event_samples)
-                        end_idx = min(chunk_data.shape[1], event_idx + post_event_samples)
-                        
-                        # Skip if segment would be incomplete
-                        if end_idx - start_idx < segment_length * 0.9:  # Allow some tolerance
-                            continue
-                        
-                        # Extract segment
-                        segment = chunk_data[:, start_idx:end_idx]
-                        
-                        # Pad if needed
-                        if segment.shape[1] < segment_length:
-                            pad_before = max(0, pre_event_samples - (event_idx - start_idx))
-                            pad_after = max(0, segment_length - segment.shape[1] - pad_before)
-                            segment = np.pad(segment, ((0, 0), (pad_before, pad_after)), mode='constant')
-                        
-                        # Add to lists
-                        chunk_segments.append(segment)
-                        segment_indices.append(total_event_segments + len(chunk_segments) - 1)
-                        segment_files.append(file)
-                        segment_event_types.append(2)  # Type 2 (high band only)
-                    
-                    # If we found segments in this chunk, add to dataset
-                    if chunk_segments:
-                        # Stack segments
-                        segments_array = np.stack(chunk_segments, axis=0)
-                        
-                        # Add to dataset with event types
-                        event_segment_dataset.add_segments(
-                            segments_array, 
-                            segment_indices, 
-                            segment_files,
-                            segment_event_types
-                        )
-                        
-                        # Update counter
-                        n_added = len(chunk_segments)
-                        total_event_segments += n_added
-                        logger.info(f"  Added {n_added} event segments from chunk")
-                        
-                        # Log counts of each event type
-                        type1_count = segment_event_types.count(1)
-                        type2_count = segment_event_types.count(2)
-                        type3_count = segment_event_types.count(3)
-                        logger.info(f"  Event types: {type1_count} type 1 (low band), {type2_count} type 2 (high band), {type3_count} type 3 (both bands)")
-                
-                # Log progress after each chunk
-                hours = total_duration_sec / 3600
-                minutes = (total_duration_sec % 3600) / 60
-                logger.info(f"  Total processed: {hours:.0f}h {minutes:.0f}m ({total_duration_sec:.1f} seconds)")
+                        # Update raw samples counter
+                        total_raw_samples += n_samples_resampled
             
+            # Process event segments directly from the whole file if enabled
+            if create_event_segment_dataset:
+                logger.info("Extracting event segments from the file")
+                
+                # Use the extract_event_segments function to create event segments
+                file_segment_dataset = extract_event_segments([file], config, max_event_segments)
+                
+                if file_segment_dataset and len(file_segment_dataset) > 0:
+                    # Merge file dataset into the main dataset
+                    if event_segment_dataset is None:
+                        event_segment_dataset = file_segment_dataset
+                    else:
+                        # Copy segments from file dataset to main dataset
+                        for i in range(len(file_segment_dataset.data)):
+                            segment_data = file_segment_dataset.data[i]
+                            abs_time = file_segment_dataset.time_arrays[i]
+                            rel_time = file_segment_dataset.rel_time_arrays[i]
+                            event_labels = file_segment_dataset.event_labels[i]
+                            day_night_labels = file_segment_dataset.day_night_labels[i]
+                            source_info = file_segment_dataset.event_sources[i]
+                            
+                            # Add segment to main dataset
+                            event_segment_dataset.add_segment(
+                                segment_data,
+                                abs_time,
+                                rel_time,
+                                event_labels,
+                                day_night_labels,
+                                source_info
+                            )
+                            
+                            total_event_segments += 1
+                            
+                    # Count events in segments
+                    segments_event_counts = {1: 0, 2: 0, 3: 0}
+                    for labels in file_segment_dataset.event_labels:
+                        segments_event_counts[1] += np.sum(labels == 1)
+                        segments_event_counts[2] += np.sum(labels == 2)
+                        segments_event_counts[3] += np.sum(labels == 3)
+                    
+                    logger.info(f"Added {len(file_segment_dataset)} segments from {os.path.basename(file)}")
+                    logger.info(f"Segments contain events: {segments_event_counts[1]} low-band, {segments_event_counts[2]} high-band, {segments_event_counts[3]} dual-band")
+                else:
+                    logger.info(f"No valid segments were extracted from {os.path.basename(file)}")
+                
         except Exception as e:
             logger.error(f"Error processing file {file}: {e}")
             import traceback
             traceback.print_exc()
     
-    # Save datasets if requested
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    if raw_dataset is not None and len(raw_dataset) > 0:
-        raw_filepath = os.path.join(save_dir, f"{timestamp}_raw_dataset.npz")
-        raw_dataset.save(raw_filepath)
-        logger.info(f"Saved raw dataset with {len(raw_dataset)} chunks and {total_raw_samples} samples")
-    
-    if bandpower_dataset is not None and len(bandpower_dataset) > 0:
-        bp_filepath = os.path.join(save_dir, f"{timestamp}_bandpower_dataset.npz")
-        bandpower_dataset.save(bp_filepath)
-        logger.info(f"Saved bandpower dataset with {len(bandpower_dataset)} chunks and {total_bandpower_windows} windows")
-    
-    if event_segment_dataset is not None and len(event_segment_dataset) > 0:
-        es_filepath = os.path.join(save_dir, f"{timestamp}_event_segments_dataset.npz")
-        event_segment_dataset.save(es_filepath)
-        logger.info(f"Saved event segment dataset with {len(event_segment_dataset)} segments")
+    # Log summary statistics for all datasets
+    if raw_dataset:
+        raw_event_counts = {1: 0, 2: 0, 3: 0}
+        for labels in raw_dataset.event_labels:
+            raw_event_counts[1] += np.sum(labels == 1)
+            raw_event_counts[2] += np.sum(labels == 2)
+            raw_event_counts[3] += np.sum(labels == 3)
         
-        # Log total counts of each event type
-        if len(event_segment_dataset.event_labels) > 0:
-            type1_count = sum(np.sum(labels == 1) for labels in event_segment_dataset.event_labels)
-            type2_count = sum(np.sum(labels == 2) for labels in event_segment_dataset.event_labels)
-            type3_count = sum(np.sum(labels == 3) for labels in event_segment_dataset.event_labels)
-            logger.info(f"Event type distribution: {type1_count} type 1 (low band), {type2_count} type 2 (high band), {type3_count} type 3 (both bands)")
+        logger.info(f"Raw dataset contains {len(raw_dataset)} chunks with {total_raw_samples} samples")
+        logger.info(f"Raw dataset events: {raw_event_counts[1]} low-band, {raw_event_counts[2]} high-band, {raw_event_counts[3]} dual-band")
+    
+    if bandpower_dataset:
+        bp_event_counts = {1: 0, 2: 0, 3: 0}
+        for labels in bandpower_dataset.event_labels:
+            bp_event_counts[1] += np.sum(labels == 1)
+            bp_event_counts[2] += np.sum(labels == 2)
+            bp_event_counts[3] += np.sum(labels == 3)
+        
+        logger.info(f"Bandpower dataset contains {len(bandpower_dataset)} chunks with {total_bandpower_windows} windows")
+        logger.info(f"Bandpower dataset events: {bp_event_counts[1]} low-band, {bp_event_counts[2]} high-band, {bp_event_counts[3]} dual-band")
+    
+    if event_segment_dataset:
+        segment_event_counts = {1: 0, 2: 0, 3: 0}
+        for labels in event_segment_dataset.event_labels:
+            segment_event_counts[1] += np.sum(labels == 1)
+            segment_event_counts[2] += np.sum(labels == 2)
+            segment_event_counts[3] += np.sum(labels == 3)
+        
+        logger.info(f"Event segment dataset contains {len(event_segment_dataset)} segments with {total_event_segments} total event segments")
+        logger.info(f"Event segment dataset events: {segment_event_counts[1]} low-band, {segment_event_counts[2]} high-band, {segment_event_counts[3]} dual-band")
     
     # Log total processing duration
     hours = total_duration_sec / 3600
     minutes = (total_duration_sec % 3600) / 60
     logger.info(f"Total data processed: {hours:.0f}h {minutes:.0f}m ({total_duration_sec:.1f} seconds)")
+    
+    # Save datasets if requested
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save raw dataset if it exists
+    if raw_dataset is not None and len(raw_dataset) > 0:
+        raw_filepath = os.path.join(save_dir, f"{timestamp}_raw_dataset.npz")
+        try:
+            raw_dataset.save(raw_filepath)
+            logger.info(f"Saved raw dataset with {len(raw_dataset)} chunks and {total_raw_samples} samples")
+        except Exception as e:
+            logger.error(f"Error saving raw dataset: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Save bandpower dataset if it exists
+    if bandpower_dataset is not None and len(bandpower_dataset) > 0:
+        bp_filepath = os.path.join(save_dir, f"{timestamp}_bandpower_dataset.npz")
+        try:
+            bandpower_dataset.save(bp_filepath)
+            logger.info(f"Saved bandpower dataset with {len(bandpower_dataset)} chunks and {total_bandpower_windows} windows")
+        except Exception as e:
+            logger.error(f"Error saving bandpower dataset: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Save event segment dataset if it exists
+    if event_segment_dataset is not None and len(event_segment_dataset) > 0:
+        es_filepath = os.path.join(save_dir, f"{timestamp}_event_segments_dataset.npz")
+        try:
+            event_segment_dataset.save(es_filepath)
+            logger.info(f"Saved event segment dataset with {len(event_segment_dataset)} segments")
+            
+            # Log total counts of each event type
+            if len(event_segment_dataset.event_labels) > 0:
+                type1_count = sum(np.sum(labels == 1) for labels in event_segment_dataset.event_labels)
+                type2_count = sum(np.sum(labels == 2) for labels in event_segment_dataset.event_labels)
+                type3_count = sum(np.sum(labels == 3) for labels in event_segment_dataset.event_labels)
+                logger.info(f"Event type distribution: {type1_count} type 1 (low band), {type2_count} type 2 (high band), {type3_count} type 3 (both bands)")
+        except Exception as e:
+            logger.error(f"Error saving event segment dataset: {e}")
+            import traceback
+            traceback.print_exc()
     
     return raw_dataset, bandpower_dataset, event_segment_dataset
 
@@ -1422,6 +2568,34 @@ def generate_day_night_labels(time_array: np.ndarray,
                 day_night_labels[i] = 0  # Night
     
     return day_night_labels
+
+def count_distinct_events(event_array):
+    """
+    Count distinct events (contiguous regions) in an event array
+    
+    Args:
+        event_array: Array of event labels (0 = no event, 1-3 = event types)
+        
+    Returns:
+        Dictionary with counts for each event type
+    """
+    event_counts = {1: 0, 2: 0, 3: 0}
+    
+    # For each event type
+    for event_type in [1, 2, 3]:
+        # Create a binary mask for this event type
+        mask = (event_array == event_type)
+        
+        if not np.any(mask):
+            continue
+            
+        # Find transitions (0->1 or 1->0)
+        transitions = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
+        
+        # Count rising edges (start of events)
+        event_counts[event_type] = np.sum(transitions == 1)
+    
+    return event_counts
 
 if __name__ == "__main__":
     # Check for command line argument
