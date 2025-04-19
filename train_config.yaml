@@ -1,0 +1,44 @@
+# MARBLE Training Configuration
+
+# Select which dataset type to train on: 'raw', 'bandpower', or 'event_segments'
+dataset_type: 'bandpower'
+band_name: 'gamma'
+device: 'cuda:0'
+
+time_label: false
+# Dataset parameters
+batch_number: 100
+chunk_per_batch: 10
+
+# Datasets paths
+dataset_paths:
+  raw: "/datasets/MARBLE/20250419_130924_raw_dataset.npz"  
+  bandpower: "/datasets/MARBLE/20250419_130924_bandpower_dataset.npz" 
+  event_segments: "/datasets/MARBLE/20250419_130924_event_segments_dataset.npz" 
+
+# Output paths
+output_dirs:
+  dataset: "./datasets/MARBLE"
+  model: "./models"
+
+# MARBLE model parameters
+marble_params:
+  epochs: 50
+  order: 2
+  hidden_channels: [ 128, 64]
+  batch_size: 256
+  lr: 1e-3
+  momentum: 0.9
+  weight_decay: 1e-4
+  out_channels: 5
+  inner_product_features: false
+  diffusion: true
+  batch_norm: true
+  seed: 42
+
+# Graph construction parameters
+graph_params:
+  graph_type: "cknn"
+  k: 100
+  sampling: false
+  number_of_eigenvectors: 100 

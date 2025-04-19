@@ -3,7 +3,7 @@
 # Data source and processing parameters
 data_dir: '/home/honglab/leijiaxin/MARBLE/preprocessed/bipolar'
 chunk_size_sec: 200                # Process data in chunks of this duration (seconds)
-# max_files: 3                      # Only process the first 3 files for testing
+# max_files: 5                      # Only process the first 3 files for testing
 
 save_dir: '/home/honglab/leijiaxin/MARBLE/datasets'
 
@@ -13,7 +13,7 @@ create_bandpower_dataset: true
 create_event_segment_dataset: true
 
 # Optional: specify a reference time (will be set to 7AM of first day if not specified)
-# reference_time: '2023-01-01 07:00:00'
+reference_time: '2024-08-14 07:00:00'
 
 # Raw dataset specific parameters
 raw_dataset:

@@ -8,6 +8,7 @@ from typing import List, Tuple, Optional, Union
 import torch
 import sys
 from scipy.signal import butter, filtfilt
+import logging
 
 # Add the path to bqk_utils.py to make the functions available
 sys.path.append('.')
@@ -176,6 +177,10 @@ def detect_interictal_events(
     
     print(f"Found {int(np.sum(labels))} time points with events out of {len(labels)} total points")
     
+    # Debug: Log the sum of the labels array
+    logger = logging.getLogger(__name__)
+    logger.debug(f"detect_interictal_events: Final labels sum = {np.sum(labels > 0)}")
+
     return labels
 
 def load_merged_data(

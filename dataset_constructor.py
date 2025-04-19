@@ -12,7 +12,7 @@ import re
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -377,28 +377,24 @@ class RawDataset(Dataset):
         return len(self.data)
     
     def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
-                        batch_size: int = None, transpose: bool = False,
-                        chunks_per_batch_item: int = 1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                        batch_size: int = 1, transpose: bool = False,
+                        chunks_per_batch_item: int = 1) -> Tuple[List, List, List]:
         """
         Get concatenated data from raw dataset with optional batching.
         
         Args:
             start_idx: Index of first chunk to include
             num_chunks: Number of chunks to include (None for all available from start_idx)
-            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            batch_size: If specified, shape output as batch of items
             transpose: Whether to transpose from (Channel x Time) to (Time x Channel)
             chunks_per_batch_item: Number of chunks to combine into each batch item
             
         Returns:
-            Tuple of (data, time_arrays, event_labels) with consistent shape:
-            - If batch_size is None and transpose=True: (time_steps, channels)
-            - If batch_size is None and transpose=False: (channels, time_steps)
-            - If batch_size is specified and transpose=True: (batch_size, time_steps, channels)
-            - If batch_size is specified and transpose=False: (batch_size, channels, time_steps)
+            Tuple of (data, time_arrays, event_labels) as lists of arrays
         """
         if not self.data:
             logger.warning("No data available in RawDataset")
-            return np.array([]), np.array([]), np.array([])
+            return [], [], []
         
         # Determine how many chunks to process
         end_idx = len(self.data) if num_chunks is None else min(start_idx + num_chunks, len(self.data))
@@ -406,143 +402,50 @@ class RawDataset(Dataset):
         
         if not chunks_to_process:
             logger.warning(f"No valid chunks in range start_idx={start_idx}, num_chunks={num_chunks}")
-            return np.array([]), np.array([]), np.array([])
+            return [], [], []
         
-        # Process data based on batching requirements
-        if batch_size is None:
-            # If chunks_per_batch_item is 1, handle as before
-            if chunks_per_batch_item == 1:
-                # Concatenate all requested chunks
-                data_chunks = [self.data[i] for i in chunks_to_process]
-                time_chunks = [self.time_arrays[i] for i in chunks_to_process]
-                event_chunks = [self.event_labels[i] for i in chunks_to_process]
-                
-                # Concatenate along time dimension (axis=1 for channel x time)
-                concatenated_data = np.concatenate(data_chunks, axis=1)
-                concatenated_time = np.concatenate(time_chunks)
-                concatenated_events = np.concatenate(event_chunks)
-                
-                # Transpose if requested (to Time x Channel)
-                if transpose:
-                    concatenated_data = concatenated_data.T
-                
-                return concatenated_data, concatenated_time, concatenated_events
-            else:
-                # Group chunks into batch items based on chunks_per_batch_item
-                total_batch_items = len(chunks_to_process) // chunks_per_batch_item
-                if total_batch_items == 0:
-                    logger.warning(f"Not enough chunks for a single batch item (have {len(chunks_to_process)}, need {chunks_per_batch_item})")
-                    return np.array([]), np.array([]), np.array([])
-                
-                batch_items_data = []
-                batch_items_time = []
-                batch_items_events = []
-                
-                # Process each group of chunks
-                for i in range(total_batch_items):
-                    chunk_group = chunks_to_process[i * chunks_per_batch_item:(i + 1) * chunks_per_batch_item]
-                    
-                    # Combine chunks in this group
-                    group_data_chunks = [self.data[j] for j in chunk_group]
-                    group_time_chunks = [self.time_arrays[j] for j in chunk_group]
-                    group_event_chunks = [self.event_labels[j] for j in chunk_group]
-                    
-                    # Concatenate this group along time dimension (axis=1 for Channel x Time)
-                    group_data = np.concatenate(group_data_chunks, axis=1)
-                    group_time = np.concatenate(group_time_chunks)
-                    group_events = np.concatenate(group_event_chunks)
-                    
-                    # Transpose if needed
-                    if transpose:
-                        group_data = group_data.T
-                    
-                    batch_items_data.append(group_data)
-                    batch_items_time.append(group_time)
-                    batch_items_events.append(group_events)
-                
-                # Since batch_size is None, concatenate all batch items
-                # We need to handle the axis differently depending on transpose
-                if transpose:
-                    # For transpose=True, data is already (Time x Channel) in each item
-                    # So concatenate on axis=0 (stacking time dimensions)
-                    all_data = np.concatenate(batch_items_data, axis=0)
-                else:
-                    # For transpose=False, data is (Channel x Time) in each item
-                    # So concatenate on axis=1 (stacking time dimensions)
-                    all_data = np.concatenate(batch_items_data, axis=1)
-                
-                all_time = np.concatenate(batch_items_time)
-                all_events = np.concatenate(batch_items_events)
-                
-                return all_data, all_time, all_events
-        else:
-            # Calculate number of batch items needed
-            total_batch_items = len(chunks_to_process) // chunks_per_batch_item
+        # Calculate number of batch items needed
+        total_batch_items = len(chunks_to_process) // chunks_per_batch_item
+        
+        # Initialize batch arrays - these will be our final output
+        batch_data = []
+        batch_times = []
+        batch_events = []
+        
+        # Process batch items
+        for item_idx in range(total_batch_items):
+            # Get chunks for this batch item
+            start_chunk = start_idx + (item_idx * chunks_per_batch_item)
+            end_chunk = start_chunk + chunks_per_batch_item
+            item_chunks = list(range(start_chunk, min(end_chunk, len(self.data))))
             
-            # Calculate number of batches based on batch items
-            num_batches = total_batch_items // batch_size
+            # Skip if no valid chunks
+            if not item_chunks:
+                continue
             
-            if num_batches == 0:
-                logger.warning(f"Not enough chunks for a single batch (have {total_batch_items} batch items, need {batch_size})")
-                return np.array([]), np.array([]), np.array([])
+            # Concatenate chunks for this batch item
+            item_data_chunks = [self.data[j] for j in item_chunks]
+            item_time_chunks = [self.time_arrays[j] for j in item_chunks]
+            item_event_chunks = [self.event_labels[j] for j in item_chunks]
             
-            # Initialize batch arrays
-            batch_data = []
-            batch_times = []
-            batch_events = []
+            item_data = np.concatenate(item_data_chunks, axis=1)
+            item_time = np.concatenate(item_time_chunks)
+            item_events = np.concatenate(item_event_chunks)
             
-            # Process each batch
-            for b in range(num_batches):
-                batch_items = list(range(b * batch_size, (b + 1) * batch_size))
+            # Transpose if needed
+            if transpose:
+                item_data = item_data.T
                 
-                # Process each batch item
-                batch_item_data = []
-                batch_item_times = []
-                batch_item_events = []
-                
-                for item_idx in batch_items:
-                    # Get chunks for this batch item
-                    start_chunk = start_idx + (item_idx * chunks_per_batch_item)
-                    end_chunk = start_chunk + chunks_per_batch_item
-                    item_chunks = list(range(start_chunk, min(end_chunk, len(self.data))))
-                    
-                    # Skip if no valid chunks
-                    if not item_chunks:
-                        continue
-                    
-                    # Concatenate chunks for this batch item
-                    item_data_chunks = [self.data[j] for j in item_chunks]
-                    item_time_chunks = [self.time_arrays[j] for j in item_chunks]
-                    item_event_chunks = [self.event_labels[j] for j in item_chunks]
-                    
-                    item_data = np.concatenate(item_data_chunks, axis=1)
-                    item_time = np.concatenate(item_time_chunks)
-                    item_events = np.concatenate(item_event_chunks)
-                    
-                    # Transpose if needed
-                    if transpose:
-                        item_data = item_data.T
-                        
-                    batch_item_data.append(item_data)
-                    batch_item_times.append(item_time)
-                    batch_item_events.append(item_events)
-                
-                if batch_item_data:
-                    # Stack all items in this batch
-                    batch_data.append(np.stack(batch_item_data))
-                    batch_times.append(np.stack(batch_item_times))
-                    batch_events.append(np.stack(batch_item_events))
+            batch_data.append(item_data)
+            batch_times.append(item_time)
+            batch_events.append(item_events)
+        
+        if not batch_data:
+            logger.warning("No valid batches created")
+            return [], [], []
             
-            if not batch_data:
-                logger.warning("No valid batches created")
-                return np.array([]), np.array([]), np.array([])
-                
-            # Stack all batches
-            batched_data = np.stack(batch_data)
-            batched_times = np.stack(batch_times)
-            batched_events = np.stack(batch_events)
-            
-            return batched_data, batched_times, batched_events
+        # Return the batch lists
+        return batch_data, batch_times, batch_events
 
 class BandpowerDataset(Dataset):
     """Dataset containing bandpower features for multiple frequency bands"""
@@ -713,29 +616,25 @@ class BandpowerDataset(Dataset):
     
     def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
                         batch_size: int = None, transpose: bool = False, 
-                        band_name: str = None, chunks_per_batch_item: int = 1) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                        band_name: str = None, chunks_per_batch_item: int = 1) -> Tuple[List, List, List]:
         """
         Get concatenated bandpower data with optional batching.
         
         Args:
             start_idx: Index of first chunk to include
             num_chunks: Number of chunks to include (None for all available from start_idx)
-            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            batch_size: If specified, shape output as batch of items
             transpose: Whether to transpose from (Windows x Channel) to (Channel x Windows)
                       Default is False, which returns (Windows x Channel)
             band_name: Which frequency band to use (if None, uses first available)
             chunks_per_batch_item: Number of chunks to combine into each batch item
             
         Returns:
-            Tuple of (data, time_arrays, event_labels) with consistent shape:
-            - If batch_size is None and transpose=False: (windows, channels)
-            - If batch_size is None and transpose=True: (channels, windows)
-            - If batch_size is specified and transpose=False: (batch_size, windows, channels)
-            - If batch_size is specified and transpose=True: (batch_size, channels, windows)
+            Tuple of (data, time_arrays, event_labels) as lists of arrays
         """
         if not self.bands:
             logger.warning("No band data available in BandpowerDataset")
-            return np.array([]), np.array([]), np.array([])
+            return [], [], []
         
         # Use specified band or first available
         if band_name is None or band_name not in self.bands:
@@ -748,172 +647,53 @@ class BandpowerDataset(Dataset):
         
         if not chunks_to_process:
             logger.warning(f"No valid chunks in range start_idx={start_idx}, num_chunks={num_chunks}")
-            return np.array([]), np.array([]), np.array([])
+            return [], [], []
         
-        # Process data based on batching requirements
-        if batch_size is None:
-            # If chunks_per_batch_item is 1, handle as before
-            if chunks_per_batch_item == 1:
-                # Concatenate all requested chunks
-                data_chunks = [self.bands[band_name][i] for i in chunks_to_process]
-                time_chunks = [self.time_arrays[i] for i in chunks_to_process]
-                event_chunks = [self.event_labels[i] for i in chunks_to_process]
-                
-                # Concatenate along time/window dimension (axis=0 for windows x channels)
-                concatenated_data = np.concatenate(data_chunks, axis=0)
-                concatenated_time = np.concatenate(time_chunks)
-                concatenated_events = np.concatenate(event_chunks)
-                
-                # Transpose if requested (to Channel x Windows)
-                if transpose:
-                    concatenated_data = concatenated_data.T
-                
-                return concatenated_data, concatenated_time, concatenated_events
-            else:
-                # Group chunks into batch items based on chunks_per_batch_item
-                total_batch_items = len(chunks_to_process) // chunks_per_batch_item
-                if total_batch_items == 0:
-                    logger.warning(f"Not enough chunks for a single batch item (have {len(chunks_to_process)}, need {chunks_per_batch_item})")
-                    return np.array([]), np.array([]), np.array([])
-                
-                batch_items_data = []
-                batch_items_time = []
-                batch_items_events = []
-                
-                # Process each group of chunks
-                for i in range(total_batch_items):
-                    chunk_group = chunks_to_process[i * chunks_per_batch_item:(i + 1) * chunks_per_batch_item]
-                    
-                    # Combine chunks in this group
-                    group_data_chunks = [self.bands[band_name][j] for j in chunk_group]
-                    group_time_chunks = [self.time_arrays[j] for j in chunk_group]
-                    group_event_chunks = [self.event_labels[j] for j in chunk_group]
-                    
-                    # Concatenate this group along window dimension (axis=0 for Windows x Channels)
-                    group_data = np.concatenate(group_data_chunks, axis=0)
-                    group_time = np.concatenate(group_time_chunks)
-                    group_events = np.concatenate(group_event_chunks)
-                    
-                    # Transpose if needed
-                    if transpose:
-                        group_data = group_data.T
-                    
-                    batch_items_data.append(group_data)
-                    batch_items_time.append(group_time)
-                    batch_items_events.append(group_events)
-                
-                # Since batch_size is None, concatenate all batch items
-                # We need to handle the axis differently depending on transpose
-                if transpose:
-                    # For transpose=True, data is already (Channel x Windows) in each item
-                    # So concatenate on axis=1 (stacking window dimensions)
-                    all_data = np.concatenate(batch_items_data, axis=1)
-                else:
-                    # For transpose=False, data is (Windows x Channel) in each item
-                    # So concatenate on axis=0 (stacking window dimensions)
-                    all_data = np.concatenate(batch_items_data, axis=0)
-                
-                all_time = np.concatenate(batch_items_time)
-                all_events = np.concatenate(batch_items_events)
-                
-                return all_data, all_time, all_events
-        else:
-            # Calculate number of batch items needed
-            total_batch_items = len(chunks_to_process) // chunks_per_batch_item
-            
-            # Calculate number of batches based on batch items
-            num_batches = total_batch_items // batch_size
-            
-            if num_batches == 0:
-                logger.warning(f"Not enough chunks for a single batch (have {total_batch_items} batch items, need {batch_size})")
-                return np.array([]), np.array([]), np.array([])
-            
-            # Initialize batch arrays
-            batch_data = []
-            batch_times = []
-            batch_events = []
-            
-            # Process each batch
-            for b in range(num_batches):
-                batch_items = list(range(b * batch_size, (b + 1) * batch_size))
-                
-                # Process each batch item
-                batch_item_data = []
-                batch_item_times = []
-                batch_item_events = []
-                
-                for item_idx in batch_items:
-                    # Get chunks for this batch item
-                    start_chunk = start_idx + (item_idx * chunks_per_batch_item)
-                    end_chunk = start_chunk + chunks_per_batch_item
-                    item_chunks = list(range(start_chunk, min(end_chunk, len(self.time_arrays))))
-                    
-                    # Skip if no valid chunks
-                    if not item_chunks:
-                        continue
-                    
-                    # Concatenate chunks for this batch item
-                    item_data_chunks = [self.bands[band_name][j] for j in item_chunks]
-                    item_time_chunks = [self.time_arrays[j] for j in item_chunks]
-                    item_event_chunks = [self.event_labels[j] for j in item_chunks]
-                    
-                    # Concatenate along window dimension (axis=0 for Windows x Channels)
-                    item_data = np.concatenate(item_data_chunks, axis=0)
-                    item_time = np.concatenate(item_time_chunks)
-                    item_events = np.concatenate(item_event_chunks)
-                    
-                    # Transpose if needed
-                    if transpose:
-                        item_data = item_data.T
-                        
-                    batch_item_data.append(item_data)
-                    batch_item_times.append(item_time)
-                    batch_item_events.append(item_events)
-                
-                if batch_item_data:
-                    # Stack all items in this batch
-                    batch_data.append(np.stack(batch_item_data))
-                    batch_times.append(np.stack(batch_item_times))
-                    batch_events.append(np.stack(batch_item_events))
-            
-            if not batch_data:
-                logger.warning("No valid batches created")
-                return np.array([]), np.array([]), np.array([])
-                
-            # Stack all batches
-            batched_data = np.stack(batch_data)
-            batched_times = np.stack(batch_times)
-            batched_events = np.stack(batch_events)
-            
-            return batched_data, batched_times, batched_events
-    
-    def get_data_for_marble(self, band_name: str = None, transpose: bool = True) -> List[np.ndarray]:
-        """
-        Get data in format suitable for MARBLE training (Channel x Time)
+        # Calculate number of batch items needed
+        total_batch_items = len(chunks_to_process) // chunks_per_batch_item
         
-        Args:
-            band_name: Which band to use. If None, uses the first available band
-            transpose: Whether to transpose from (Windows x Channels) to (Channels x Windows)
+        # Initialize batch arrays - these will be our final output
+        batch_data = []
+        batch_times = []
+        batch_events = []
+        
+        # Process batch items
+        for item_idx in range(total_batch_items):
+            # Get chunks for this batch item
+            start_chunk = start_idx + (item_idx * chunks_per_batch_item)
+            end_chunk = start_chunk + chunks_per_batch_item
+            item_chunks = list(range(start_chunk, min(end_chunk, len(self.time_arrays))))
             
-        Returns:
-            List of arrays in (Channel x Time) format
-        """
-        if not self.bands:
-            logger.error("No band data available")
-            return []
+            # Skip if no valid chunks
+            if not item_chunks:
+                continue
+            
+            # Concatenate chunks for this batch item
+            item_data_chunks = [self.bands[band_name][j] for j in item_chunks]
+            item_time_chunks = [self.time_arrays[j] for j in item_chunks]
+            item_event_chunks = [self.event_labels[j] for j in item_chunks]
+            
+            # Concatenate along window dimension (axis=0 for Windows x Channels)
+            item_data = np.concatenate(item_data_chunks, axis=0)
+            item_time = np.concatenate(item_time_chunks)
+            item_events = np.concatenate(item_event_chunks)
+            
+            # Transpose if needed
+            if transpose:
+                item_data = item_data.T
+                
+            # Add directly to the batch lists
+            batch_data.append(item_data)
+            batch_times.append(item_time)
+            batch_events.append(item_events)
         
-        # Use specified band or first available
-        if band_name is None or band_name not in self.bands:
-            band_name = list(self.bands.keys())[0]
-            logger.info(f"Using band '{band_name}' for MARBLE data")
-        
-        band_data = self.bands[band_name]
-        
-        if transpose:
-            # Convert from (Windows x Channels) to (Channels x Windows)
-            return [data.T for data in band_data]
-        else:
-            return band_data
+        if not batch_data:
+            logger.warning("No valid batch items created")
+            return [], [], []
+            
+        # Return the batch lists
+        return batch_data, batch_times, batch_events
+
 
 class EventSegmentDataset(Dataset):
     """Dataset containing only segments with high-frequency events"""
@@ -1313,29 +1093,25 @@ class EventSegmentDataset(Dataset):
     
     def get_batched_data(self, start_idx: int = 0, num_chunks: int = None, 
                         batch_size: int = None, transpose: bool = False,
-                        chunks_per_batch_item: int = 1, use_relative_time: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                        chunks_per_batch_item: int = 1, use_relative_time: bool = True) -> Tuple[List, List, List]:
         """
         Get concatenated or batched event segment data.
         
         Args:
             start_idx: Index of first segment to include
             num_chunks: Number of segments to include (None for all available from start_idx)
-            batch_size: If specified, shape output as (batch_size, time_steps, channels)
+            batch_size: If specified, shape output as batch of items
             transpose: Whether to transpose from (Channel x Time) to (Time x Channel)
                       Default is False, which returns (Time x Channel) when concatenated
             chunks_per_batch_item: Number of chunks/segments to combine into each batch item
             use_relative_time: Whether to use relative time (True) or absolute time (False)
             
         Returns:
-            Tuple of (data, time_arrays, event_labels) with consistent shape:
-            - If batch_size is None and transpose=False: (time_steps, channels)
-            - If batch_size is None and transpose=True: (channels, time_steps)
-            - If batch_size is specified and transpose=False: (batch_size, time_steps, channels)
-            - If batch_size is specified and transpose=True: (batch_size, channels, time_steps)
+            Tuple of (data, time_arrays, event_labels) as lists of arrays
         """
         if not self.data:
             logger.warning("No data available in EventSegmentDataset")
-            return np.array([]), np.array([]), np.array([])
+            return [], [], []
         
         # Determine how many segments to process
         end_idx = len(self.data) if num_chunks is None else min(start_idx + num_chunks, len(self.data))
@@ -1343,146 +1119,52 @@ class EventSegmentDataset(Dataset):
         
         if not segments_to_process:
             logger.warning(f"No valid segments in range start_idx={start_idx}, num_chunks={num_chunks}")
-            return np.array([]), np.array([]), np.array([])
+            return [], [], []
         
-        # Process data based on batching requirements
-        if batch_size is None:
-            # If chunks_per_batch_item is 1, handle as before
-            if chunks_per_batch_item == 1:
-                # Concatenate all requested segments
-                data_segments = [self.data[i] for i in segments_to_process]
-                # Use relative or absolute time based on parameter
-                time_segments = [self.rel_time_arrays[i] if use_relative_time else self.time_arrays[i] for i in segments_to_process]
-                event_segments = [self.event_labels[i] for i in segments_to_process]
-                
-                # Concatenate along time dimension (axis=1 for Channel x Time)
-                concatenated_data = np.concatenate(data_segments, axis=1)
-                concatenated_time = np.concatenate(time_segments)
-                concatenated_events = np.concatenate(event_segments)
-                
-                # Transpose if requested (to Time x Channel)
-                if transpose:
-                    concatenated_data = concatenated_data.T
-                
-                return concatenated_data, concatenated_time, concatenated_events
-            else:
-                # Group segments into batch items based on chunks_per_batch_item
-                total_batch_items = len(segments_to_process) // chunks_per_batch_item
-                if total_batch_items == 0:
-                    logger.warning(f"Not enough segments for a single batch item (have {len(segments_to_process)}, need {chunks_per_batch_item})")
-                    return np.array([]), np.array([]), np.array([])
-                
-                batch_items_data = []
-                batch_items_time = []
-                batch_items_events = []
-                
-                # Process each group of segments
-                for i in range(total_batch_items):
-                    segment_group = segments_to_process[i * chunks_per_batch_item:(i + 1) * chunks_per_batch_item]
-                    
-                    # Combine segments in this group
-                    group_data_segments = [self.data[j] for j in segment_group]
-                    # Use relative or absolute time based on parameter
-                    group_time_segments = [self.rel_time_arrays[j] if use_relative_time else self.time_arrays[j] for j in segment_group]
-                    group_event_segments = [self.event_labels[j] for j in segment_group]
-                    
-                    # Concatenate this group along time dimension (axis=1 for Channel x Time)
-                    group_data = np.concatenate(group_data_segments, axis=1)
-                    group_time = np.concatenate(group_time_segments)
-                    group_events = np.concatenate(group_event_segments)
-                    
-                    # Transpose if needed
-                    if transpose:
-                        group_data = group_data.T
-                    
-                    batch_items_data.append(group_data)
-                    batch_items_time.append(group_time)
-                    batch_items_events.append(group_events)
-                
-                # Since batch_size is None, concatenate all batch items
-                # We need to handle the axis differently depending on transpose
-                if transpose:
-                    # For transpose=True, data is already (Time x Channel) in each item
-                    # So concatenate on axis=0 (stacking time dimensions)
-                    all_data = np.concatenate(batch_items_data, axis=0)
-                else:
-                    # For transpose=False, data is (Channel x Time) in each item
-                    # So concatenate on axis=1 (stacking time dimensions)
-                    all_data = np.concatenate(batch_items_data, axis=1)
-                
-                all_time = np.concatenate(batch_items_time)
-                all_events = np.concatenate(batch_items_events)
-                
-                return all_data, all_time, all_events
-        else:
-            # Calculate number of batch items needed
-            total_batch_items = len(segments_to_process) // chunks_per_batch_item
+        # Calculate number of batch items needed
+        total_batch_items = len(segments_to_process) // chunks_per_batch_item
+        
+        # Initialize batch arrays - these will be our final output
+        batch_data = []
+        batch_times = []
+        batch_events = []
+        
+        # Process batch items
+        for item_idx in range(total_batch_items):
+            # Get segments for this batch item
+            start_segment = start_idx + (item_idx * chunks_per_batch_item)
+            end_segment = start_segment + chunks_per_batch_item
+            item_segments = list(range(start_segment, min(end_segment, len(self.data))))
             
-            # Calculate number of batches based on batch items
-            num_batches = total_batch_items // batch_size
+            # Skip if no valid segments
+            if not item_segments:
+                continue
             
-            if num_batches == 0:
-                logger.warning(f"Not enough segments for a single batch (have {total_batch_items} batch items, need {batch_size})")
-                return np.array([]), np.array([]), np.array([])
+            # Concatenate segments for this batch item
+            item_data_segments = [self.data[j] for j in item_segments]
+            # Use relative or absolute time based on parameter
+            item_time_segments = [self.rel_time_arrays[j] if use_relative_time else self.time_arrays[j] for j in item_segments]
+            item_event_segments = [self.event_labels[j] for j in item_segments]
             
-            # Initialize batch arrays
-            batch_data = []
-            batch_times = []
-            batch_events = []
+            item_data = np.concatenate(item_data_segments, axis=1)
+            item_time = np.concatenate(item_time_segments)
+            item_events = np.concatenate(item_event_segments)
             
-            # Process each batch
-            for b in range(num_batches):
-                batch_items = list(range(b * batch_size, (b + 1) * batch_size))
+            # Transpose if needed
+            if transpose:
+                item_data = item_data.T
                 
-                # Process each batch item
-                batch_item_data = []
-                batch_item_times = []
-                batch_item_events = []
-                
-                for item_idx in batch_items:
-                    # Get segments for this batch item
-                    start_segment = start_idx + (item_idx * chunks_per_batch_item)
-                    end_segment = start_segment + chunks_per_batch_item
-                    item_segments = list(range(start_segment, min(end_segment, len(self.data))))
-                    
-                    # Skip if no valid segments
-                    if not item_segments:
-                        continue
-                    
-                    # Concatenate segments for this batch item
-                    item_data_segments = [self.data[j] for j in item_segments]
-                    # Use relative or absolute time based on parameter
-                    item_time_segments = [self.rel_time_arrays[j] if use_relative_time else self.time_arrays[j] for j in item_segments]
-                    item_event_segments = [self.event_labels[j] for j in item_segments]
-                    
-                    item_data = np.concatenate(item_data_segments, axis=1)
-                    item_time = np.concatenate(item_time_segments)
-                    item_events = np.concatenate(item_event_segments)
-                    
-                    # Transpose if needed
-                    if transpose:
-                        item_data = item_data.T
-                        
-                    batch_item_data.append(item_data)
-                    batch_item_times.append(item_time)
-                    batch_item_events.append(item_events)
-                
-                if batch_item_data:
-                    # Stack all items in this batch
-                    batch_data.append(np.stack(batch_item_data))
-                    batch_times.append(np.stack(batch_item_times))
-                    batch_events.append(np.stack(batch_item_events))
+            # Add directly to the batch lists
+            batch_data.append(item_data)
+            batch_times.append(item_time)
+            batch_events.append(item_events)
+        
+        if not batch_data:
+            logger.warning("No valid batch items created")
+            return [], [], []
             
-            if not batch_data:
-                logger.warning("No valid batches created")
-                return np.array([]), np.array([]), np.array([])
-                
-            # Stack all batches
-            batched_data = np.stack(batch_data)
-            batched_times = np.stack(batch_times)
-            batched_events = np.stack(batch_events)
-            
-            return batched_data, batched_times, batched_events
+        # Return the batch lists
+        return batch_data, batch_times, batch_events
 
 def extract_band_power(data: np.ndarray, 
                       sfreq: float, 
@@ -1565,15 +1247,17 @@ def extract_band_power(data: np.ndarray,
 def map_events_to_windows(event_array: np.ndarray, 
                          window_times: np.ndarray, 
                          sfreq: float, 
-                         window_size_ms: float) -> np.ndarray:
+                         window_size_ms: float,
+                         chunk_start_time_abs: float) -> np.ndarray:
     """
     Map event array to windows based on window center times
     
     Args:
         event_array: Event array for raw data (samples) with values 0, 1, 2, 3
-        window_times: Array of window center times
+        window_times: Array of window center times (absolute time, relative to reference)
         sfreq: Sampling frequency
         window_size_ms: Window size in milliseconds
+        chunk_start_time_abs: Absolute start time of the chunk corresponding to event_array
         
     Returns:
         Array of event labels for windows (preserving event types 1, 2, 3)
@@ -1584,18 +1268,25 @@ def map_events_to_windows(event_array: np.ndarray,
     half_window = int(window_size_ms * sfreq / 2000)
     
     for i, window_time in enumerate(window_times):
-        # Calculate the sample index in the original data
-        central_sample_idx = int(window_time * sfreq)
+        # Calculate the time relative to the start of the chunk
+        time_in_chunk = window_time - chunk_start_time_abs
         
-        # Use a small window around the central point to check for events
-        start_sample = max(0, central_sample_idx - half_window)
-        end_sample = min(len(event_array), central_sample_idx + half_window)
+        # Calculate the sample index corresponding to the window center *within the chunk*
+        central_sample_idx_in_chunk = int(time_in_chunk * sfreq)
         
-        # Extract event window
-        window = event_array[start_sample:end_sample]
+        # Use a small window around the central point *within the chunk* to check for events
+        start_sample_in_chunk = max(0, central_sample_idx_in_chunk - half_window)
+        end_sample_in_chunk = min(len(event_array), central_sample_idx_in_chunk + half_window)
+        
+        # Extract event window from the chunk's event array
+        # Ensure indices are valid before slicing
+        if start_sample_in_chunk < end_sample_in_chunk and start_sample_in_chunk < len(event_array) and end_sample_in_chunk > 0:
+            window = event_array[start_sample_in_chunk:end_sample_in_chunk]
+        else:
+            window = np.array([]) # Empty window if indices are invalid
         
         # If any events in window, find the most important one (prioritize type 3, then 2, then 1)
-        if np.any(window > 0):
+        if window.size > 0 and np.any(window > 0):
             if np.any(window == 3):
                 window_events[i] = 3  # Both bands (highest priority)
             elif np.any(window == 2):
@@ -2208,6 +1899,10 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
             logger.info(f"Found {total_events} distinct events: {event_counts[1]} low-band only, {event_counts[2]} high-band only, {event_counts[3]} dual-band")
             logger.info(f"Found {len(low_band_regions)} low-band regions, {len(high_band_regions)} high-band regions, {len(combined_regions)} combined regions")
             
+            # Debug: Log sums of detected event arrays
+            logger.debug(f"Event sums: Low={np.sum(file_low_band_events > 0)}, High={np.sum(file_high_band_events > 0)}, Combined={np.sum(file_combined_events > 0)}")
+            logger.debug(f"Distinct event counts: Low={event_counts[1]}, High={event_counts[2]}, Both={event_counts[3]}")
+            
             # Calculate chunk size in samples and number of chunks
             chunk_samples = int(chunk_size_sec * original_sfreq)
             n_chunks = max(1, n_samples_original // chunk_samples)
@@ -2242,6 +1937,7 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
                     chunk_event_regions = find_contiguous_events(chunk_events)
                     chunk_event_counts = count_distinct_events(chunk_events)
                     total_chunk_events = sum(chunk_event_counts.values())
+                    logger.debug(f"  Chunk {chunk_idx+1}: Event sum = {np.sum(chunk_events > 0)}, Distinct events = {total_chunk_events}")
                     
                     logger.info(f"  Chunk contains {total_chunk_events} distinct events: " +
                                f"{chunk_event_counts[1]} low-band, {chunk_event_counts[2]} high-band, " + 
@@ -2278,18 +1974,21 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
                                 reference_time=reference_time
                             )
                             
-                            # Map events to windows - pass the combined events
+                            # Map events to windows - pass the combined events and chunk start time
+                            chunk_start_time_abs = time_array_original[start_sample]
                             window_events = map_events_to_windows(
                                 chunk_events,
                                 window_times,
                                 original_sfreq,
-                                bandpower_params['window_size_ms']
+                                bandpower_params['window_size_ms'],
+                                chunk_start_time_abs=chunk_start_time_abs
                             )
                             
                             # Debug window event counts
                             window_event_counts = {}
                             for event_type in [1, 2, 3]:
                                 window_event_counts[event_type] = np.sum(window_events == event_type)
+                            logger.debug(f"  Bandpower chunk {chunk_idx+1}: Window events sum = {np.sum(window_events > 0)}, Distinct mapped events = {sum(window_event_counts.values())}")
                             
                             logger.info(f"  Mapped {sum(window_event_counts.values())} events to windows: " +
                                       f"{window_event_counts[1]} low-band, {window_event_counts[2]} high-band, " + 
@@ -2354,32 +2053,59 @@ def construct_dataset_from_config(config_path: str) -> Tuple[Optional[RawDataset
                         
                         # Create a time mapping from original to resampled
                         orig_times = np.linspace(0, chunk_duration, len(chunk_events))
-                        resampled_times = np.linspace(0, chunk_duration, n_samples_resampled)
+                        resampled_times_rel = np.linspace(0, chunk_duration, n_samples_resampled) # Relative to chunk start
+                        dt_resampled = chunk_duration / n_samples_resampled
                         
-                        # For each type of event (1, 2, 3), find where it occurs and map to resampled timeline
-                        for event_type in [1, 2, 3]:
-                            # Find where this event type occurs in original data
-                            event_indices = np.where(chunk_events == event_type)[0]
+                        # --- Improved Event Mapping Logic --- 
+                        for k, resampled_time_rel in enumerate(resampled_times_rel):
+                            # Define the time interval for this resampled point
+                            interval_start = resampled_time_rel - dt_resampled / 2
+                            interval_end = resampled_time_rel + dt_resampled / 2
                             
-                            if len(event_indices) > 0:
-                                # For each event, map to nearest timepoint in resampled data
-                                for idx in event_indices:
-                                    # Get time of this event in seconds from chunk start
-                                    event_time = orig_times[idx]
-                                    
-                                    # Find nearest time in resampled timeline
-                                    nearest_idx = np.argmin(np.abs(resampled_times - event_time))
-                                    
-                                    # Set the event in resampled data
-                                    if 0 <= nearest_idx < len(resampled_events):
-                                        resampled_events[nearest_idx] = event_type
-                        
+                            # Find original time indices that fall within this interval
+                            orig_indices = np.where((orig_times >= interval_start) & (orig_times < interval_end))[0]
+                            
+                            if orig_indices.size > 0:
+                                # Get events within this interval from the original chunk_events
+                                events_in_interval = chunk_events[orig_indices]
+                                
+                                # Find the highest priority event type in the interval
+                                if np.any(events_in_interval == 3):
+                                    resampled_events[k] = 3
+                                elif np.any(events_in_interval == 2):
+                                    resampled_events[k] = 2
+                                elif np.any(events_in_interval == 1):
+                                    resampled_events[k] = 1
+                                # else: remains 0 (no event)
+                        # --- End Improved Event Mapping --- 
+
+                        # --- Original Nearest Neighbor Mapping (commented out) ---
+                        # # For each type of event (1, 2, 3), find where it occurs and map to resampled timeline
+                        # for event_type in [1, 2, 3]:
+                        #     # Find where this event type occurs in original data
+                        #     event_indices = np.where(chunk_events == event_type)[0]
+                        #     
+                        #     if len(event_indices) > 0:
+                        #         # For each event, map to nearest timepoint in resampled data
+                        #         for idx in event_indices:
+                        #             # Get time of this event in seconds from chunk start
+                        #             event_time = orig_times[idx]
+                        #             
+                        #             # Find nearest time in resampled timeline
+                        #             nearest_idx = np.argmin(np.abs(resampled_times_rel - event_time))
+                        #             
+                        #             # Set the event in resampled data, prioritizing higher types
+                        #             if 0 <= nearest_idx < len(resampled_events):
+                        #                 resampled_events[nearest_idx] = max(resampled_events[nearest_idx], event_type)
+                        # --- End Original Mapping --- 
+
                         # Count resampled events for debugging
                         resampled_event_counts = {
                             1: np.sum(resampled_events == 1),
                             2: np.sum(resampled_events == 2),
                             3: np.sum(resampled_events == 3)
                         }
+                        logger.debug(f"  Raw chunk {chunk_idx+1}: Resampled events sum = {np.sum(resampled_events > 0)}, Distinct mapped events = {sum(resampled_event_counts.values())}")
                         
                         logger.info(f"  Mapped {sum(resampled_event_counts.values())} events to resampled data: " +
                                    f"{resampled_event_counts[1]} low-band, {resampled_event_counts[2]} high-band, " + 
