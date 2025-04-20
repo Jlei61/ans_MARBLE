@@ -429,6 +429,7 @@ class RawDataset(Dataset):
             item_event_chunks = [self.event_labels[j] for j in item_chunks]
             
             item_data = np.concatenate(item_data_chunks, axis=1)
+            item_data = item_data.astype(np.float32) # Ensure float32 dtype
             item_time = np.concatenate(item_time_chunks)
             item_events = np.concatenate(item_event_chunks)
             
@@ -673,8 +674,8 @@ class BandpowerDataset(Dataset):
             item_time_chunks = [self.time_arrays[j] for j in item_chunks]
             item_event_chunks = [self.event_labels[j] for j in item_chunks]
             
-            # Concatenate along window dimension (axis=0 for Windows x Channels)
             item_data = np.concatenate(item_data_chunks, axis=0)
+            item_data = item_data.astype(np.float32) # Ensure float32 dtype
             item_time = np.concatenate(item_time_chunks)
             item_events = np.concatenate(item_event_chunks)
             
@@ -1147,6 +1148,7 @@ class EventSegmentDataset(Dataset):
             item_event_segments = [self.event_labels[j] for j in item_segments]
             
             item_data = np.concatenate(item_data_segments, axis=1)
+            item_data = item_data.astype(np.float32) # Ensure float32 dtype
             item_time = np.concatenate(item_time_segments)
             item_events = np.concatenate(item_event_segments)
             

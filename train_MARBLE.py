@@ -59,7 +59,8 @@ def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_
             start_idx=0, 
             num_chunks=batch_number*chunk_per_batch,
             batch_size=batch_number,
-            chunks_per_batch_item=chunk_per_batch
+            chunks_per_batch_item=chunk_per_batch,
+            transpose=True,
         )
     
     # Process each batch separately
@@ -70,7 +71,8 @@ def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_
     # Process each batch separately
     for batch_idx in range(len(batch_data)):
         # Get data and events for this batch
-        data = batch_data[batch_idx]  # (Time, Channels)
+        data = batch_data[batch_idx].astype(np.float32)  # (Time, Channels)
+        print(data.shape)
         
         if time_label:
             # Use time as labels (make it relative to first time point)
@@ -89,9 +91,9 @@ def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_
         batch_labels = labels[:-1]
         
         # Add to lists
-        pos_list_batched.append(pos)
-        x_list_batched.append(x)
-        labels_batched.append(batch_labels)
+        pos_list_batched.append(pos.astype(np.float32))
+        x_list_batched.append(x.astype(np.float32))
+        labels_batched.append(batch_labels.astype(np.float32))
     
     return pos_list_batched, x_list_batched, labels_batched
 

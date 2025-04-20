@@ -1,17 +1,17 @@
 # MARBLE Training Configuration
 
 # Select which dataset type to train on: 'raw', 'bandpower', or 'event_segments'
-dataset_type: 'bandpower'
-band_name: 'gamma'
-device: 'cuda:0'
+dataset_type: 'event_segments'
+band_name: 'high_gamma'
+device: 'cuda:1'
 
 time_label: false
 # Pre-constructed MARBLE dataset path (if provided, will use this instead of constructing a new one)
-prebuilt_dataset_path: "./datasets/MARBLE/marble_bandpower_b50_c10_dataset.pkl"
+# prebuilt_dataset_path: "./datasets/MARBLE/marble_bandpower_b50_c10_dataset.pkl"
 
 # Dataset parameters
-batch_number: 50
-chunk_per_batch: 10
+batch_number: 15
+chunk_per_batch: 100
 
 # Datasets paths
 dataset_paths:
@@ -28,14 +28,14 @@ output_dirs:
 marble_params:
   epochs: 50
   order: 2
-  hidden_channels: [128, 64]
+  hidden_channels: [256, 128,64]
   batch_size: 256
-  lr: 0.001
+  lr: 0.01
   momentum: 0.9
   weight_decay: 0.0001
   out_channels: 5
   inner_product_features: false
-  diffusion: false
+  diffusion: true
   batch_norm: true
   seed: 42
 
@@ -48,4 +48,4 @@ graph_params:
   number_of_eigenvectors: 100
 
 # Example config entry
-patience: 10  # Stop training if no improvement for 15 epochs 
+patience: 5  # Stop training if no improvement for 15 epochs 
