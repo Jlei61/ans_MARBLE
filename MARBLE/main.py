@@ -60,18 +60,22 @@ class net(nn.Module):
         """
         super().__init__()
 
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        device = torch.device("cpu")
-        
+        # Use the device parameter from params if provided, otherwise use default
         if loadpath is not None:
             if Path(loadpath).is_dir():
                 loadpath = max(glob.glob(f"{loadpath}/best_model*"))
-            self.params = torch.load(loadpath, map_location=device)["params"]
+            self.params = torch.load(loadpath, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))["params"]
         else:
             if params is not None:
                 self.params = params
             else:
                 self.params = {}
+        
+        # Use the device parameter if provided
+        if 'device' in self.params:
+            self.device = torch.device(self.params['device'])
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self._epoch = 0  # to resume optimisation
         self.parse_parameters(data)
@@ -369,6 +373,10 @@ class net(nn.Module):
         # training scheduler
         scheduler = opt.lr_scheduler.ReduceLROnPlateau(optimizer)
 
+        # Early stopping parameters
+        patience = self.params.get("patience", 10)  # Default patience of 10 epochs
+        early_stop_counter = 0
+        
         best_loss = -1
         self.losses = {"train_loss": [], "val_loss": [], "test_loss": []}
         for epoch in range(
@@ -392,7 +400,16 @@ class net(nn.Module):
                     optimizer, self.losses, outdir=outdir, best=True, timestamp=self.timestamp
                 )
                 best_loss = val_loss
+                early_stop_counter = 0  # Reset counter when validation loss improves
                 print(" *", end="")
+            else:
+                early_stop_counter += 1  # Increment counter when validation loss doesn't improve
+                print(f" [{early_stop_counter}/{patience}]", end="")
+                
+                # Check if early stopping criterion is met
+                if early_stop_counter >= patience:
+                    print(f"\nEarly stopping triggered after {epoch+1} epochs. Best validation loss: {best_loss:.4f}")
+                    break
 
             self.losses["train_loss"].append(train_loss)
             self.losses["val_loss"].append(val_loss)
@@ -412,7 +429,7 @@ class net(nn.Module):
             loadpath: directory with models to load best model, or specific model path
         """
         checkpoint = torch.load(
-            loadpath, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            loadpath, map_location=self.device
         )
         self._epoch = checkpoint["epoch"]
         self.load_state_dict(checkpoint["model_state_dict"])

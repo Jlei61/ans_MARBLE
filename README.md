@@ -16,7 +16,7 @@ The code supports three types of datasets:
 3. Run the training script:
 
 ```bash
-python train_marble_datasets.py
+python train_MARBLE.py
 ```
 
 ## Configuration
@@ -27,6 +27,7 @@ The configuration file (`train_config.yaml`) contains the following parameters:
 - `time_label`: Whether to use time as label instead of events (default: false)
 - `band_name`: For bandpower datasets, specify which frequency band to use
 - `device`: GPU device to use for training (e.g., 'cuda:0', 'cuda:1')
+- `prebuilt_dataset_path`: Path to a pre-constructed MARBLE dataset (to avoid memory issues)
 - `batch_number`: Number of batches to create
 - `chunk_per_batch`: Number of chunks per batch item
 - `dataset_paths`: Paths to your prepared datasets
@@ -41,6 +42,23 @@ The training script generates:
 - Trained model pickle file (in `output_dirs.model`)
 
 All output filenames include information about the dataset type, batch size, and chunks per batch.
+
+## Memory Optimization
+
+If you encounter CUDA Out Of Memory (OOM) errors during training, you can:
+
+1. **Use a pre-constructed dataset**: Run the script once to construct and save the dataset, then set `prebuilt_dataset_path` in the config to use that saved dataset file.
+
+   ```yaml
+   # Use a pre-constructed dataset
+   prebuilt_dataset_path: "./datasets/MARBLE/marble_bandpower_b100_c10_dataset.pkl"
+   ```
+
+2. **Reduce model complexity**:
+   - Decrease `batch_size` in marble_params
+   - Reduce `hidden_channels` sizes
+   - Lower `k` in graph_params
+   - Decrease `number_of_eigenvectors`
 
 ## Examples
 
@@ -64,5 +82,13 @@ device: 'cuda:1'
 ```yaml
 dataset_type: 'event_segments'
 time_label: true
+device: 'cuda:0'
+```
+
+### Using a pre-constructed dataset to save memory
+
+```yaml
+dataset_type: 'bandpower'
+prebuilt_dataset_path: "./datasets/MARBLE/marble_bandpower_b100_c10_dataset.pkl"
 device: 'cuda:0'
 ``` 

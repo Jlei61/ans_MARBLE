@@ -117,6 +117,13 @@ def train_marble_model(anchor_list, vector_list, labels_list, config, dataset_ty
     chunk_per_batch = config['chunk_per_batch']
     device = config.get('device', 'cuda:0')
     
+    # Extract early stopping patience parameter if present
+    if 'patience' in config:
+        marble_params['patience'] = config['patience']
+    
+    # Check if we should load a pre-constructed dataset
+    prebuilt_dataset_path = config.get('prebuilt_dataset_path', None)
+    
     # Construct dataset save path with more information
     dataset_save_path = os.path.join(
         output_dirs['dataset'], 
@@ -127,32 +134,44 @@ def train_marble_model(anchor_list, vector_list, labels_list, config, dataset_ty
         f"marble_{dataset_type}_b{batch_number}_c{chunk_per_batch}_model.pkl"
     )
     
-    # Construct MARBLE dataset
-    logger.info(f"Constructing MARBLE dataset for {dataset_type} data...")
-    try:
-        marble_dataset = MARBLE.construct_dataset(
-            anchor=anchor_list,
-            vector=vector_list,
-            label=labels_list,
-            graph_type=graph_params['graph_type'],
-            k=graph_params['k'],
-            Sampling=graph_params['sampling'],
-            number_of_eigenvectors=graph_params['number_of_eigenvectors']
-        )
-        
-        # Save dataset
-        with open(dataset_save_path, 'wb') as f:
-            pickle.dump(marble_dataset, f)
-        logger.info(f"MARBLE dataset saved to {dataset_save_path}")
-    except Exception as e:
-        logger.error(f"Error constructing dataset: {e}")
-        return None
+    # Either load or construct MARBLE dataset
+    if prebuilt_dataset_path and os.path.exists(prebuilt_dataset_path):
+        logger.info(f"Loading pre-constructed MARBLE dataset from {prebuilt_dataset_path}")
+        try:
+            with open(prebuilt_dataset_path, 'rb') as f:
+                marble_dataset = pickle.load(f)
+                logger.info(f"Successfully loaded pre-constructed MARBLE dataset")
+        except Exception as e:
+            logger.error(f"Error loading dataset: {e}")
+            return None
+    else:
+        # Construct MARBLE dataset
+        logger.info(f"Constructing MARBLE dataset for {dataset_type} data...")
+        try:
+            marble_dataset = MARBLE.construct_dataset(
+                anchor=anchor_list,
+                vector=vector_list,
+                label=labels_list,
+                graph_type=graph_params['graph_type'],
+                k=graph_params['k'],
+                Sampling=graph_params['sampling'],
+                number_of_eigenvectors=graph_params['number_of_eigenvectors']
+            )
+            
+            # Save dataset
+            with open(dataset_save_path, 'wb') as f:
+                pickle.dump(marble_dataset, f)
+            logger.info(f"MARBLE dataset saved to {dataset_save_path}")
+        except Exception as e:
+            logger.error(f"Error constructing dataset: {e}")
+            return None
     
     # Train MARBLE model
     logger.info(f"Training MARBLE model on {dataset_type} data...")
     try:
         # Set the specified device
         marble_params['device'] = device
+        logger.info(f"Using device: {device}")
             
         model = MARBLE.net(marble_dataset, params=marble_params)
         model.fit(marble_dataset)
@@ -180,6 +199,20 @@ def main():
         logger.error(f"Invalid dataset type: {dataset_type}. Must be one of: raw, bandpower, event_segments")
         return
     
+    # Check if we're using a prebuilt dataset
+    prebuilt_dataset_path = config.get('prebuilt_dataset_path', None)
+    if prebuilt_dataset_path and os.path.exists(prebuilt_dataset_path):
+        logger.info(f"Using pre-constructed MARBLE dataset: {prebuilt_dataset_path}")
+        # Pass empty lists to train_marble_model since they won't be used
+        model = train_marble_model(
+            [], [], [], 
+            config, dataset_type
+        )
+        if model:
+            logger.info(f"MARBLE model training completed successfully for pre-constructed dataset")
+        return
+    
+    # Process raw data if no prebuilt dataset is specified
     # Get dataset path from config
     dataset_path = config['dataset_paths'].get(dataset_type)
     if not dataset_path:
@@ -210,16 +243,9 @@ def main():
     elif dataset_type == 'bandpower':
         dataset = BandpowerDataset.load(dataset_path)
         
-        # Get available bands
-        bands = dataset.available_bands
-        logger.info(f"Available bands: {bands}")
-        
         # Get band from config or use default
         band_name = config.get('band_name', 'gamma')
-        if band_name not in bands:
-            band_name = bands[0]
-            logger.warning(f"Specified band '{config.get('band_name')}' not available, using '{band_name}' instead")
-        
+
         logger.info(f"Using band: {band_name}")
         
         anchor_list, vector_list, labels_list = prepare_marble_data(

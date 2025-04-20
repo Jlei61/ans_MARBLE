@@ -6,15 +6,18 @@ band_name: 'gamma'
 device: 'cuda:0'
 
 time_label: false
+# Pre-constructed MARBLE dataset path (if provided, will use this instead of constructing a new one)
+prebuilt_dataset_path: "./datasets/MARBLE/marble_bandpower_b50_c10_dataset.pkl"
+
 # Dataset parameters
-batch_number: 100
+batch_number: 50
 chunk_per_batch: 10
 
 # Datasets paths
 dataset_paths:
-  raw: "/datasets/MARBLE/20250419_130924_raw_dataset.npz"  
-  bandpower: "/datasets/MARBLE/20250419_130924_bandpower_dataset.npz" 
-  event_segments: "/datasets/MARBLE/20250419_130924_event_segments_dataset.npz" 
+  raw: "./datasets/20250419_130924_raw_dataset.npz"  
+  bandpower: "./datasets/20250419_130924_bandpower_dataset.npz" 
+  event_segments: "./datasets/20250419_130924_event_segments_dataset.npz" 
 
 # Output paths
 output_dirs:
@@ -25,20 +28,24 @@ output_dirs:
 marble_params:
   epochs: 50
   order: 2
-  hidden_channels: [ 128, 64]
+  hidden_channels: [128, 64]
   batch_size: 256
-  lr: 1e-3
+  lr: 0.001
   momentum: 0.9
-  weight_decay: 1e-4
+  weight_decay: 0.0001
   out_channels: 5
   inner_product_features: false
-  diffusion: true
+  diffusion: false
   batch_norm: true
   seed: 42
+
 
 # Graph construction parameters
 graph_params:
   graph_type: "cknn"
   k: 100
   sampling: false
-  number_of_eigenvectors: 100 
+  number_of_eigenvectors: 100
+
+# Example config entry
+patience: 10  # Stop training if no improvement for 15 epochs 

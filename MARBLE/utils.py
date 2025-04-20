@@ -13,7 +13,8 @@ from torch import Tensor
 from torch_sparse import SparseTensor
 from tqdm import tqdm
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Default device - will be overridden when using model.device
+default_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(0)
 
 
@@ -30,7 +31,7 @@ def print_settings(model):
 
     print("\n---- Number of features to pass to the MLP: ", n_features)
     print("---- Total number of parameters: ", n_parameters)
-    print(f"\nUsing device {device}")
+    print(f"\nUsing device {model.device}")
 
 
 def parallel_proc(fun, iterable, inputs, processes=-1, desc=""):
@@ -54,6 +55,8 @@ def move_to_gpu(model, data, adjs=None):
 
     assert hasattr(data, "kernels"), "It seems that data is not preprocessed. Run preprocess(data)!"
 
+    # Use model.device instead of the global device variable
+    device = model.device
     model = model.to(device)
     data.x = data.x.to(device)
     data.pos = data.pos.to(device)
@@ -90,6 +93,8 @@ def detach_from_gpu(model, data, adjs=None):
 
     assert hasattr(data, "kernels"), "It seems that data is not preprocessed. Run preprocess(data)!"
 
+    # Use model.device instead of the global device variable
+    device = model.device
     model = model.to(device)
     data.x = data.x.detach().cpu()
     data.pos = data.pos.detach().cpu()
