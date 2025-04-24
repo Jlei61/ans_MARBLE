@@ -294,10 +294,19 @@ def losses(model):
 
 def voronoi(clusters, ax):
     """Voronoi tesselation of clusters"""
-    vor = Voronoi(clusters["centroids"])
+    centroids = clusters["centroids"]
+    
+    # Check if centroids are higher than 2D and project if needed
+    if centroids.shape[1] > 2:
+        centroids_2d, _ = embed(centroids, embed_typ="PCA")
+    else:
+        centroids_2d = centroids
+        
+    vor = Voronoi(centroids_2d)
     voronoi_plot_2d(vor, ax=ax, show_vertices=False)
+    
     for k in range(clusters["n_clusters"]):
-        ax.annotate(k + 1, clusters["centroids"][k, :])
+        ax.annotate(k + 1, centroids_2d[k, :])
 
 
 def neighbourhoods(

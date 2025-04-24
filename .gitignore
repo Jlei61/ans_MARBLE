@@ -1,11 +1,12 @@
-examples/
+MARBLE/examples/
 preprocessed/
-outputs/
-results/
-temp_Figures/
+Figures/
 temp_Data/
-datasets/
+Datasets/
+models/
 
+Dockerfile
+*.log
 *.pt
 *.png
 *.svg

@@ -1326,12 +1326,10 @@ def extract_event_segments(files: List[str], config: dict, max_event_segments: O
     # Get segment parameters
     segment_params = config.get('event_segments', {
         'fixed_segment_length_ms': 100,  # All segments will have exactly this length
-        'min_duration_ms': 20           # Minimum event duration to include
     })
     
     # Get segment length parameters
     fixed_segment_length_ms = segment_params.get('fixed_segment_length_ms', 100)
-    min_duration_ms = segment_params.get('min_duration_ms', 20)
     
     total_segments = 0
     all_segment_files = []
@@ -1359,7 +1357,6 @@ def extract_event_segments(files: List[str], config: dict, max_event_segments: O
             
             # Calculate length parameters in samples
             fixed_segment_length_samples = int(fixed_segment_length_ms * sfreq / 1000)
-            min_duration_samples = int(min_duration_ms * sfreq / 1000)
             
             # Detect events
             logger.info(f"Detecting events in {os.path.basename(file)}")
@@ -1439,11 +1436,6 @@ def extract_event_segments(files: List[str], config: dict, max_event_segments: O
                 
                 # Get the actual event duration
                 event_duration = end_idx - start_idx
-                
-                # Skip if event is too short (below minimum duration)
-                if event_duration < min_duration_samples:
-                    logger.debug(f"Skipping event {event_idx} (too short: {event_duration/sfreq*1000:.1f}ms < {min_duration_ms}ms)")
-                    continue
                 
                 # Calculate segment boundaries to get exactly fixed_segment_length_samples
                 if event_duration <= fixed_segment_length_samples:
@@ -1618,7 +1610,6 @@ def extract_event_segments(files: List[str], config: dict, max_event_segments: O
         'segment_files': all_segment_files,
         'segment_indices': all_segment_indices,
         'fixed_segment_length_ms': fixed_segment_length_ms,
-        'min_duration_ms': min_duration_ms,
         'extraction_config': config
     })
     
