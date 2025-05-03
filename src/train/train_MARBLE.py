@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 os.makedirs("./datasets/MARBLE", exist_ok=True)
 os.makedirs("./models", exist_ok=True)
 
-def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_batch=10, time_label=False):
+def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_batch=10, time_label=False, use_pca=False, n_components=None):
     """
     Prepare data for MARBLE training from a dataset
     
@@ -40,6 +40,8 @@ def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_
         batch_number: Number of batches to create
         chunk_per_batch: Number of chunks per batch item
         time_label: If True, use batch time as label instead of batch events
+        use_pca: Whether to apply PCA dimensionality reduction to channel dimension
+        n_components: Number of principal components to keep (if use_pca is True)
         
     Returns:
         anchor_list, vector_list, labels_list for MARBLE training
@@ -68,11 +70,35 @@ def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_
     x_list_batched = []
     labels_batched = []
 
+    # Apply PCA if requested
+    if use_pca and n_components is not None:
+        from sklearn.decomposition import PCA
+        logger.info(f"Applying PCA to reduce dimensions from {batch_data[0].shape[1]} to {n_components} components")
+        
+        # Concatenate all batch data for fitting PCA
+        all_data = np.vstack([batch.reshape(-1, batch.shape[-1]) for batch in batch_data])
+        
+        # Fit PCA on all data
+        pca = PCA(n_components=n_components)
+        pca.fit(all_data)
+        logger.info(f"PCA explained variance ratio: {np.sum(pca.explained_variance_ratio_):.4f}")
+        
+        # Transform each batch separately
+        batch_data_pca = []
+        for batch in batch_data:
+            original_shape = batch.shape
+            # Reshape to 2D for PCA, then back to original shape but with reduced dimensions
+            transformed = pca.transform(batch.reshape(-1, original_shape[-1]))
+            batch_data_pca.append(transformed.reshape(original_shape[0], n_components))
+        
+        # Replace original batch data with PCA-transformed data
+        batch_data = batch_data_pca
+
     # Process each batch separately
     for batch_idx in range(len(batch_data)):
         # Get data and events for this batch
         data = batch_data[batch_idx].astype(np.float32)  # (Time, Channels)
-        print(data.shape)
+        print(f"Batch {batch_idx} data shape: {data.shape}")
         
         if time_label:
             # Use time as labels (make it relative to first time point)
@@ -94,6 +120,10 @@ def prepare_marble_data(dataset, band_name='gamma', batch_number=100, chunk_per_
         pos_list_batched.append(pos.astype(np.float32))
         x_list_batched.append(x.astype(np.float32))
         labels_batched.append(batch_labels.astype(np.float32))
+    
+    # Debug - print the shape of the anchor list (first batch)
+    if len(pos_list_batched) > 0:
+        logger.info(f"Anchor list shape: {pos_list_batched[0].shape}, Vector list shape: {x_list_batched[0].shape}")
     
     return pos_list_batched, x_list_batched, labels_batched
 
@@ -126,15 +156,30 @@ def train_marble_model(anchor_list, vector_list, labels_list, config, dataset_ty
     # Check if we should load a pre-constructed dataset
     prebuilt_dataset_path = config.get('prebuilt_dataset_path', None)
     
+    # Get embedding type abbreviation
+    inner_product = marble_params.get('inner_product_features', False)
+    embedding_type = "EA" if inner_product else "EAG"  # EA: Embedding-Aware, EAG: Embedding-AGnostic
+    
     # Construct dataset save path with more information
-    dataset_save_path = os.path.join(
-        output_dirs['dataset'], 
-        f"marble_{dataset_type}_b{batch_number}_c{chunk_per_batch}_dataset.pkl"
-    )
-    model_save_path = os.path.join(
-        output_dirs['model'], 
-        f"marble_{dataset_type}_b{batch_number}_c{chunk_per_batch}_model.pkl"
-    )
+    if dataset_type == 'bandpower':
+        band_name = config.get('band_name', 'gamma')
+        dataset_save_path = os.path.join(
+            output_dirs['dataset'], 
+            f"marble_{dataset_type}_{band_name}_b{batch_number}_c{chunk_per_batch}_{embedding_type}_dataset.pkl"
+        )
+        model_save_path = os.path.join(
+            output_dirs['model'], 
+            f"marble_{dataset_type}_{band_name}_b{batch_number}_c{chunk_per_batch}_{embedding_type}_model.pkl"
+        )
+    else:
+        dataset_save_path = os.path.join(
+            output_dirs['dataset'], 
+            f"marble_{dataset_type}_b{batch_number}_c{chunk_per_batch}_{embedding_type}_dataset.pkl"
+        )
+        model_save_path = os.path.join(
+            output_dirs['model'], 
+            f"marble_{dataset_type}_b{batch_number}_c{chunk_per_batch}_{embedding_type}_model.pkl"
+        )
     
     # Either load or construct MARBLE dataset
     if prebuilt_dataset_path and os.path.exists(prebuilt_dataset_path):
@@ -230,7 +275,13 @@ def main():
     chunk_per_batch = config['chunk_per_batch']
     time_label = config.get('time_label', False)
     
+    # Extract PCA parameters from config
+    use_pca = config.get('use_pca', False)
+    n_components = config.get('pca_components', None)
+    
     logger.info(f"Processing {dataset_type} dataset: {os.path.basename(dataset_path)}")
+    if use_pca:
+        logger.info(f"Using PCA with {n_components} components")
     
     # Process based on dataset type
     if dataset_type == 'raw':
@@ -239,7 +290,9 @@ def main():
             dataset, 
             batch_number=batch_number, 
             chunk_per_batch=chunk_per_batch,
-            time_label=time_label
+            time_label=time_label,
+            use_pca=use_pca,
+            n_components=n_components
         )
         
     elif dataset_type == 'bandpower':
@@ -255,7 +308,9 @@ def main():
             band_name=band_name,
             batch_number=batch_number, 
             chunk_per_batch=chunk_per_batch,
-            time_label=time_label
+            time_label=time_label,
+            use_pca=use_pca,
+            n_components=n_components
         )
         
     elif dataset_type == 'event_segments':
@@ -264,7 +319,9 @@ def main():
             dataset, 
             batch_number=batch_number, 
             chunk_per_batch=chunk_per_batch,
-            time_label=time_label
+            time_label=time_label,
+            use_pca=use_pca,
+            n_components=n_components
         )
     
     # Check if data was prepared successfully

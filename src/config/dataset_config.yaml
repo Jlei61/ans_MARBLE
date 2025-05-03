@@ -1,11 +1,16 @@
 # Dataset Construction Configuration
 
 # Data source and processing parameters
-data_dir: '/home/honglab/leijiaxin/MARBLE/preprocessed/bipolar'
+# data_dir: '/home/honglab/leijiaxin/MARBLE/preprocessed/bipolar'
+data_dir: '/home/honglab/leijiaxin/VEEG/Data/yuquan/Preprocessed_SEEG/wangyaobei'
 chunk_size_sec: 200                # Process data in chunks of this duration (seconds)
 # max_files: 5                      # Only process the first 3 files for testing
 
-save_dir: '/home/honglab/leijiaxin/MARBLE/datasets'
+save_dir: '/home/honglab/leijiaxin/MARBLE/Datasets'
+# Subject-specific processing
+use_subject_format: true            # Use subject-based file format
+subject_id: 'wangyaobei'              # Subject ID - will be used if files don't have subject info
+# max_subjects: 5                    # Limit number of subjects to process
 
 # Dataset types to create
 create_raw_dataset: true
@@ -24,7 +29,7 @@ raw_dataset:
 # Event detection parameters for standard events
 event_detection:
   low_band: [80, 250]    # Frequency band for standard events (Hz)
-  high_band: [250, 400]  # Frequency band for high-frequency events (Hz)
+  high_band: [250, 451]  # Frequency band for high-frequency events (Hz)
   rel_thresh: 3.0        # Relative threshold factor
   abs_thresh: 3.0        # Absolute threshold factor
   min_gap: 20            # Minimum gap between events (samples)
@@ -42,4 +47,4 @@ bandpower:
   overlap: 0.5           # Overlap between consecutive windows (0.0-1.0)
   bands:                 # Frequency bands to extract (Hz)
     gamma: [80, 250]
-    high_gamma: [250, 400]
+    high_gamma: [250, 451]

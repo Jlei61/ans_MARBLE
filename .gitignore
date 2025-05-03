@@ -1,9 +1,5 @@
-MARBLE/examples/
-preprocessed/
-Figures/
-temp_Data/
-Datasets/
-models/
+data/
+results/
 
 Dockerfile
 *.log
@@ -12,3 +8,5 @@ Dockerfile
 *.svg
 *.pdf
 *.html
+
+.cursor/

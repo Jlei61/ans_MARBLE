@@ -1,27 +1,32 @@
 # MARBLE Training Configuration
 
 # Select which dataset type to train on: 'raw', 'bandpower', or 'event_segments'
-dataset_type: 'bandpower'
-band_name: 'high_gamma'
+dataset_type: 'raw'
+band_name: 'gamma'
 device: 'cuda:1'
 
 time_label: false
 # Pre-constructed MARBLE dataset path (if provided, will use this instead of constructing a new one)
-# prebuilt_dataset_path: "./datasets/MARBLE/marble_bandpower_b50_c10_dataset.pkl"
+prebuilt_dataset_path: "./datasets/MARBLE/marble_raw_b20_c2_EAG_dataset.pkl"
 
 # Dataset parameters
-batch_number: 30
-chunk_per_batch: 20
+batch_number: 20
+chunk_per_batch: 2
+
+# PCA dimensionality reduction parameters
+use_pca: false           # Whether to apply PCA dimensionality reduction
+pca_components: 20      # Number of principal components to keep (lower to reduce computation)
 
 # Datasets paths
 dataset_paths:
-  raw: "./datasets/20250419_130924_raw_dataset.npz"  
-  bandpower: "./datasets/20250419_130924_bandpower_dataset.npz" 
-  event_segments: "./datasets/20250419_130924_event_segments_dataset.npz" 
+  # raw: "./Datasets/20250419_130924_raw_dataset.npz"  
+  raw: "./Datasets/wangyaobei_raw_dataset.npz"
+  bandpower: "./Datasets/fengling_bandpower_dataset.npz" 
+  event_segments: "./Datasets/20250419_130924_event_segments_dataset.npz" 
 
 # Output paths
 output_dirs:
-  dataset: "./datasets/MARBLE"
+  dataset: "./Datasets/MARBLE"
   model: "./models"
 
 # MARBLE model parameters
@@ -33,7 +38,7 @@ marble_params:
   lr: 0.01
   momentum: 0.9
   weight_decay: 0.0001
-  out_channels: 5
+  out_channels: 4
   inner_product_features: false
   diffusion: true
   batch_norm: true
@@ -44,8 +49,8 @@ marble_params:
 graph_params:
   graph_type: "cknn"
   k: 100
-  sampling: false
+  sampling: true
   number_of_eigenvectors: 100
 
 # Example config entry
-patience: 8  # Stop training if no improvement for 15 epochs 
+patience: 10  # Stop training if no improvement for 15 epochs 
