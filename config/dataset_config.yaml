@@ -6,7 +6,7 @@ data_dir: '/home/honglab/leijiaxin/VEEG/Data/yuquan/Preprocessed_SEEG/wangyaobei
 chunk_size_sec: 200                # Process data in chunks of this duration (seconds)
 # max_files: 5                      # Only process the first 3 files for testing
 
-save_dir: '/home/honglab/leijiaxin/MARBLE/Datasets'
+save_dir: '/home/honglab/leijiaxin/MARBLE/data/datasets'
 # Subject-specific processing
 use_subject_format: true            # Use subject-based file format
 subject_id: 'wangyaobei'              # Subject ID - will be used if files don't have subject info

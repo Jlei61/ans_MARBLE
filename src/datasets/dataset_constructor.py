@@ -10,8 +10,12 @@ from typing import List, Tuple, Dict, Optional, Union
 import logging
 import re
 
-from datasets import RawDataset, BandpowerDataset, EventSegmentDataset
-from data_processing import *
+# Add parent directory to path to import modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Update imports to use correct paths
+from datasets.datasets_class import RawDataset, BandpowerDataset, EventSegmentDataset
+from utils.data_processing import *
 
 # Set up logging
 logging.basicConfig(

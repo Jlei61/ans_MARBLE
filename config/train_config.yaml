@@ -1,17 +1,25 @@
 # MARBLE Training Configuration
 
 # Select which dataset type to train on: 'raw', 'bandpower', or 'event_segments'
-dataset_type: 'raw'
+dataset_type: 'bandpower'
 band_name: 'gamma'
-device: 'cuda:1'
+device: 'cuda:0'
 
 time_label: false
 # Pre-constructed MARBLE dataset path (if provided, will use this instead of constructing a new one)
-prebuilt_dataset_path: "./datasets/MARBLE/marble_raw_b20_c2_EAG_dataset.pkl"
+# prebuilt_dataset_path: "/home/honglab/leijiaxin/MARBLE/data/datasets/MARBLE/marble_raw_b10_c5_dataset.pkl"
+
+# Sequential training control
+# 0 or negative: Process all data sequentially in blocks.
+# N > 0: Process exactly N sequential blocks.
+# 1 (or omitted): Process only the first block (original behavior).
+num_sequential_iterations: 5
 
 # Dataset parameters
-batch_number: 20
-chunk_per_batch: 2
+batch_number: 30
+chunk_per_batch: 10
+
+mask_label_ratio: .7 # Ratio of labeled points to mask (0.0 means no masking based on labels)
 
 # PCA dimensionality reduction parameters
 use_pca: false           # Whether to apply PCA dimensionality reduction
@@ -20,25 +28,25 @@ pca_components: 20      # Number of principal components to keep (lower to reduc
 # Datasets paths
 dataset_paths:
   # raw: "./Datasets/20250419_130924_raw_dataset.npz"  
-  raw: "./Datasets/wangyaobei_raw_dataset.npz"
-  bandpower: "./Datasets/fengling_bandpower_dataset.npz" 
-  event_segments: "./Datasets/20250419_130924_event_segments_dataset.npz" 
+  raw: "/home/honglab/leijiaxin/MARBLE/data/datasets/20250419_130924_raw_dataset.npz"
+  bandpower: "/home/honglab/leijiaxin/MARBLE/data/datasets/20250419_130924_bandpower_dataset.npz" 
+  event_segments: "/home/honglab/leijiaxin/MARBLE/data/datasets/20250419_130924_event_segments_dataset.npz" 
 
 # Output paths
 output_dirs:
-  dataset: "./Datasets/MARBLE"
-  model: "./models"
+  dataset: "/home/honglab/leijiaxin/MARBLE/data/datasets/MARBLE"
+  model: "/home/honglab/leijiaxin/MARBLE/results/models"
 
 # MARBLE model parameters
 marble_params:
   epochs: 50
   order: 2
   hidden_channels: [256, 128,64]
-  batch_size: 256
+  batch_size: 128
   lr: 0.01
   momentum: 0.9
   weight_decay: 0.0001
-  out_channels: 4
+  out_channels: 5
   inner_product_features: false
   diffusion: true
   batch_norm: true
@@ -50,7 +58,8 @@ graph_params:
   graph_type: "cknn"
   k: 100
   sampling: true
-  number_of_eigenvectors: 100
+  number_of_eigenvectors: 50
+  
 
 # Example config entry
 patience: 10  # Stop training if no improvement for 15 epochs 
